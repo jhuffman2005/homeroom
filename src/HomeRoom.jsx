@@ -28,6 +28,12 @@ function useAuth() {
       email, password, options: { data: { name } }
     });
     if (error) throw error;
+    // Immediately sign in after signup since email confirm is off
+    if (data?.user) {
+      const { data: signInData, error: signInError } = await supabase.auth.signInWithPassword({ email, password });
+      if (signInError) throw signInError;
+      return signInData;
+    }
     return data;
   };
 
