@@ -1304,7 +1304,7 @@ function GenerationModal({ tool, kids, onClose, onSave }) {
     const kid = selectedKid;
     const prompt = buildPrompt(tool, kid, subject, topic);
     try {
-      const res = await fetch("https://api.anthropic.com/v1/messages", {
+      const res = await fetch("/api/generate", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -1479,7 +1479,7 @@ Example format:
             { type: "text", text: prompt }
           ];
 
-      const res = await fetch("https://api.anthropic.com/v1/messages", {
+      const res = await fetch("/api/generate", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
