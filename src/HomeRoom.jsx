@@ -1483,7 +1483,7 @@ function GenerationModal({ tool, kids, onClose, onSave }) {
   const [output, setOutput] = useState("");
   const [saved, setSaved] = useState(false);
 
-  const selectedKid = kids.find(k => k.id === parseInt(kidId));
+  const selectedKid = kids.find(k => String(k.id) === String(kidId));
   const subjects = selectedKid?.subjects || [];
 
   const generate = async () => {
@@ -1510,7 +1510,7 @@ function GenerationModal({ tool, kids, onClose, onSave }) {
         toolId: tool.id,
         toolIcon: tool.icon,
         toolTitle: tool.title,
-        kidId: parseInt(kidId),
+        kidId: kidId,
         kidName: kid?.name,
         subject,
         topic,
@@ -1601,7 +1601,7 @@ function CurriculumUploadModal({ kids, onClose, onSave }) {
   const [error, setError] = useState("");
   const fileInputRef = React.useRef();
 
-  const selectedKid = kids.find(k => k.id === parseInt(kidId));
+  const selectedKid = kids.find(k => String(k.id) === String(kidId));
   const subjects = selectedKid?.subjects || [];
 
   const handleFile = (f) => {
@@ -1693,7 +1693,7 @@ Example format:
   };
 
   const handleSave = () => {
-    onSave({ kidId: parseInt(kidId), subject, weeks });
+    onSave({ kidId: kidId, subject, weeks });
     onClose();
   };
 
