@@ -1,27 +1,31 @@
 import React, { useState, useEffect } from "react";
+import { useAuth } from "./hooks/useAuth";
+import { useHomeRoom } from "./hooks/useHomeRoom";
 
 // ─── Design Tokens ────────────────────────────────────────────────────────────
 const styles = `
-  @import url('https://fonts.googleapis.com/css2?family=Playfair+Display:wght@400;600;700&family=Lato:wght@300;400;700&display=swap');
+  @import url('https://fonts.googleapis.com/css2?family=Caveat:wght@400;600;700&family=Playfair+Display:wght@400;600;700&family=Lato:wght@300;400;700&display=swap');
 
   * { box-sizing: border-box; margin: 0; padding: 0; }
 
   :root {
-    --cream: #FAF7F2;
-    --cream-dark: #F0EBE1;
-    --green: #3D6B4F;
-    --green-light: #5A8C6A;
-    --green-pale: #EAF2EC;
+    --cream: #FDF8F3;
+    --cream-dark: #F2E9DC;
+    --green: #4A7C5F;
+    --green-light: #6A9E7F;
+    --green-pale: #EDF5F0;
     --chalk: #F5F0E8;
-    --brown: #7A5C3A;
-    --brown-light: #C4A882;
-    --text: #2C2C2C;
-    --text-muted: #7A7468;
+    --brown: #8B6347;
+    --brown-light: #C9A882;
+    --rose: #E8C4B8;
+    --rose-pale: #FDF0EC;
+    --text: #2C2416;
+    --text-muted: #8A7968;
     --white: #FFFFFF;
-    --shadow: 0 2px 16px rgba(60,50,30,0.10);
-    --shadow-lg: 0 8px 40px rgba(60,50,30,0.13);
-    --radius: 14px;
-    --radius-sm: 8px;
+    --shadow: 0 2px 16px rgba(60,40,20,0.08);
+    --shadow-lg: 0 8px 40px rgba(60,40,20,0.12);
+    --radius: 16px;
+    --radius-sm: 10px;
   }
 
   body {
@@ -32,7 +36,8 @@ const styles = `
   }
 
   h1, h2, h3 {
-    font-family: 'Playfair Display', serif;
+    font-family: 'Caveat', cursive;
+    letter-spacing: 0.01em;
   }
 
   /* ── Auth Screen ── */
@@ -73,16 +78,18 @@ const styles = `
   }
 
   .auth-logo h1 {
-    font-size: 2rem;
+    font-size: 2.8rem;
     color: var(--green);
-    letter-spacing: -0.5px;
+    letter-spacing: 0.02em;
   }
 
   .auth-logo p {
     color: var(--text-muted);
-    font-size: 0.9rem;
+    font-size: 0.92rem;
     margin-top: 4px;
-    font-style: italic;
+    font-family: 'Caveat', cursive;
+    font-size: 1.1rem;
+    color: var(--brown-light);
   }
 
   .auth-tabs {
@@ -216,8 +223,8 @@ const styles = `
   }
 
   .topbar-logo {
-    font-family: 'Playfair Display', serif;
-    font-size: 1.5rem;
+    font-family: 'Caveat', cursive;
+    font-size: 1.9rem;
     color: var(--green);
     font-weight: 700;
     display: flex;
@@ -278,7 +285,7 @@ const styles = `
   }
 
   .greeting h2 {
-    font-size: 1.9rem;
+    font-size: 2.4rem;
     color: var(--text);
     margin-bottom: 4px;
   }
@@ -286,6 +293,8 @@ const styles = `
   .greeting p {
     color: var(--text-muted);
     font-size: 1rem;
+    font-family: 'Caveat', cursive;
+    font-size: 1.15rem;
   }
 
   .suggestion-banner {
@@ -1061,28 +1070,7 @@ const styles = `
   }
 `;
 
-// ─── Mock Data ────────────────────────────────────────────────────────────────
-const MOCK_KIDS = [
-  {
-    id: 1,
-    name: "Emma",
-    grade: "6th Grade",
-    emoji: "📚",
-    learningStyle: "Visual",
-    subjects: ["Saxon Math 7/6", "Writing & Rhetoric", "Apologia Science", "History of the World"],
-    currentTopics: { "Saxon Math 7/6": "Fractions & Decimals — Week 18", "Writing & Rhetoric": "Narrative Essays" }
-  },
-  {
-    id: 2,
-    name: "Liam",
-    grade: "3rd Grade",
-    emoji: "🎨",
-    learningStyle: "Kinesthetic",
-    subjects: ["Math-U-See Beta", "All About Reading", "Story of the World Vol. 1"],
-    currentTopics: { "Math-U-See Beta": "Multiplication — Week 12" }
-  }
-];
-
+// ─── Constants ────────────────────────────────────────────────────────────────
 const GRADE_OPTIONS = [
   "Kindergarten","1st Grade","2nd Grade","3rd Grade","4th Grade",
   "5th Grade","6th Grade","7th Grade","8th Grade","9th Grade",
@@ -1118,15 +1106,28 @@ function getInitials(name) {
 }
 
 // ─── Auth Screen ──────────────────────────────────────────────────────────────
-function AuthScreen({ onLogin }) {
+function AuthScreen({ onLogin, onSignup }) {
   const [tab, setTab] = useState("login");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [name, setName] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState("");
 
-  const handle = () => {
-    if (!email) return;
-    onLogin({ email, name: name || email.split("@")[0] });
+  const handle = async () => {
+    if (!email || !password) return;
+    setLoading(true);
+    setError("");
+    try {
+      if (tab === "login") {
+        await onLogin(email, password);
+      } else {
+        await onSignup(email, password, name || email.split("@")[0]);
+      }
+    } catch (e) {
+      setError(e.message || "Something went wrong. Please try again.");
+    }
+    setLoading(false);
   };
 
   return (
@@ -1157,8 +1158,13 @@ function AuthScreen({ onLogin }) {
           <label>Password</label>
           <input type="password" placeholder="••••••••" value={password} onChange={e => setPassword(e.target.value)} />
         </div>
-        <button className="btn-primary" onClick={handle}>
-          {tab === "login" ? "Sign In to HomeRoom" : "Create My Account"}
+        {error && (
+          <div style={{ background: "#fde8e8", color: "#c0392b", borderRadius: 8, padding: "10px 14px", fontSize: "0.85rem", marginBottom: 16 }}>
+            ⚠️ {error}
+          </div>
+        )}
+        <button className="btn-primary" onClick={handle} disabled={loading}>
+          {loading ? "Just a moment..." : tab === "login" ? "Sign In to HomeRoom" : "Create My Account"}
         </button>
       </div>
     </div>
@@ -1304,7 +1310,7 @@ function GenerationModal({ tool, kids, onClose, onSave }) {
     const kid = selectedKid;
     const prompt = buildPrompt(tool, kid, subject, topic);
     try {
-      const res = await fetch("/api/generate", {
+      const res = await fetch("https://api.anthropic.com/v1/messages", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -1479,11 +1485,11 @@ Example format:
             { type: "text", text: prompt }
           ];
 
-      const res = await fetch("/api/generate", {
+      const res = await fetch("https://api.anthropic.com/v1/messages", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          model: "claude-sonnet-4-5",
+          model: "claude-sonnet-4-20250514",
           max_tokens: 1000,
           messages: [{ role: "user", content: messageContent }]
         })
@@ -1647,28 +1653,39 @@ function HistoryViewer({ item, onClose, onDelete }) {
 }
 
 // ─── Dashboard ────────────────────────────────────────────────────────────────
-function Dashboard({ user, kids: initialKids, semesterDates, onAddKid }) {
-  const [kids, setKids] = useState(initialKids);
+function Dashboard({ user, kids: initialKids, semesterDates, onAddKid, onSaveGeneration, onDeleteGeneration, onSaveCurriculum, onSignOut }) {
+  const [kids, setKids] = useState(initialKids || []);
   const [activeTool, setActiveTool] = useState(null);
   const [activeTab, setActiveTab] = useState("dashboard");
   const [history, setHistory] = useState([]);
   const [viewingItem, setViewingItem] = useState(null);
   const [historyFilter, setHistoryFilter] = useState("all");
 
-  const handleSaveToHistory = (entry) => {
+  // Keep local kids in sync when Supabase data loads
+  React.useEffect(() => { setKids(initialKids || []); }, [initialKids]);
+
+  const handleSaveToHistory = async (entry) => {
+    if (onSaveGeneration) {
+      try { await onSaveGeneration(entry); } catch (e) { console.error(e); }
+    }
     setHistory(prev => [entry, ...prev]);
   };
 
-  const handleDeleteFromHistory = (id) => {
+  const handleDeleteFromHistory = async (id) => {
+    if (onDeleteGeneration) {
+      try { await onDeleteGeneration(id); } catch (e) { console.error(e); }
+    }
     setHistory(prev => prev.filter(h => h.id !== id));
   };
 
-  const handleCurriculumSave = ({ kidId, subject, weeks }) => {
+  const handleCurriculumSave = async ({ kidId, subject, weeks }) => {
+    if (onSaveCurriculum) {
+      try { await onSaveCurriculum({ kidId, subject, weeks }); } catch (e) { console.error(e); }
+    }
     setKids(prev => prev.map(k => {
       if (k.id !== kidId) return k;
       const updatedCurriculumWeeks = { ...(k.curriculumWeeks || {}), [subject]: weeks };
-      // Also update currentTopics to reflect current week's topic
-      const weekNum = semesterDates.start ? getWeekNumber(semesterDates.start) : 1;
+      const weekNum = semesterDates?.start ? getWeekNumber(semesterDates.start) : 1;
       const currentWeek = weeks.find(w => w.week === weekNum) || weeks[0];
       const updatedTopics = { ...(k.currentTopics || {}), [subject]: currentWeek?.topic || `Week ${weekNum}` };
       return { ...k, curriculumWeeks: updatedCurriculumWeeks, currentTopics: updatedTopics };
@@ -1696,6 +1713,9 @@ function Dashboard({ user, kids: initialKids, semesterDates, onAddKid }) {
             <div className="user-avatar">{getInitials(user.name)}</div>
             {user.name}
           </div>
+          {onSignOut && (
+            <button className="btn-secondary" style={{ fontSize: "0.8rem", padding: "6px 12px" }} onClick={onSignOut}>Sign Out</button>
+          )}
         </div>
       </nav>
 
@@ -1905,22 +1925,36 @@ function Dashboard({ user, kids: initialKids, semesterDates, onAddKid }) {
 
 // ─── App Root ─────────────────────────────────────────────────────────────────
 export default function HomeRoom() {
-  const [user, setUser] = useState(null);
-  const [setupDone, setSetupDone] = useState(false);
-  const [kids, setKids] = useState(MOCK_KIDS);
-  const [semesterDates, setSemesterDates] = useState({ start: "2025-08-25", end: "2025-12-20" });
-  const [addingKid, setAddingKid] = useState(false);
+  const { user, loading: authLoading, signIn, signUp, signOut } = useAuth();
+  const {
+    kids, semester, history, dataLoading, setupDone,
+    saveKid, saveSemester, saveCurriculumWeeks,
+    saveGeneration, deleteGeneration, completeSetup
+  } = useHomeRoom(user?.id);
 
-  const handleLogin = (u) => setUser(u);
+  // Loading spinner while checking auth session
+  if (authLoading || (user && dataLoading)) return (
+    <>
+      <style>{styles}</style>
+      <div style={{ minHeight: "100vh", display: "flex", alignItems: "center", justifyContent: "center", background: "var(--cream)", fontFamily: "'Caveat', cursive", fontSize: "1.4rem", color: "var(--green)" }}>
+        🏫 Loading HomeRoom...
+      </div>
+    </>
+  );
 
-  const handleSetupComplete = ({ kids: newKids, semesterDates: dates }) => {
-    setKids(prev => [...prev, ...newKids]);
-    setSemesterDates(dates);
-    setSetupDone(true);
-  };
+  if (!user) return (
+    <>
+      <style>{styles}</style>
+      <AuthScreen onLogin={signIn} onSignup={signUp} />
+    </>
+  );
 
-  if (!user) return <><style>{styles}</style><AuthScreen onLogin={handleLogin} /></>;
-  if (!setupDone) return <><style>{styles}</style><SetupFlow user={user} onComplete={handleSetupComplete} /></>;
+  if (!setupDone) return (
+    <>
+      <style>{styles}</style>
+      <SetupFlow user={user} onComplete={completeSetup} />
+    </>
+  );
 
   return (
     <>
@@ -1928,8 +1962,13 @@ export default function HomeRoom() {
       <Dashboard
         user={user}
         kids={kids}
-        semesterDates={semesterDates}
-        onAddKid={() => setAddingKid(true)}
+        semesterDates={semester}
+        history={history}
+        onSaveGeneration={saveGeneration}
+        onDeleteGeneration={deleteGeneration}
+        onSaveCurriculum={({ kidId, subject, weeks }) => saveCurriculumWeeks({ kidId, subject, weeks })}
+        onSignOut={signOut}
+        onAddKid={saveKid}
       />
     </>
   );
