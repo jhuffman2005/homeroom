@@ -1483,7 +1483,7 @@ function GenerationModal({ tool, kids, onClose, onSave }) {
   const [output, setOutput] = useState("");
   const [saved, setSaved] = useState(false);
 
-  const selectedKid = kids.find(k => k.id === parseInt(kidId));
+  const selectedKid = kids.find(k => String(k.id) === String(kidId));
   const subjects = selectedKid?.subjects || [];
 
   const generate = async () => {
@@ -1602,7 +1602,7 @@ function CurriculumUploadModal({ kids, onClose, onSave }) {
   const [error, setError] = useState("");
   const fileInputRef = React.useRef();
 
-  const selectedKid = kids.find(k => k.id === parseInt(kidId));
+  const selectedKid = kids.find(k => String(k.id) === String(kidId));
   const subjects = selectedKid?.subjects || [];
 
   const handleFile = (f) => {
