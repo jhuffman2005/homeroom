@@ -1,6 +1,183 @@
 import React, { useState, useEffect } from "react";
-import { useAuth } from "./hooks/useAuth";
-import { useHomeRoom } from "./hooks/useHomeRoom";
+import { createClient } from "@supabase/supabase-js";
+
+// ─── Supabase Client ──────────────────────────────────────────────────────────
+const supabase = createClient(
+  import.meta.env.VITE_SUPABASE_URL,
+  import.meta.env.VITE_SUPABASE_ANON_KEY
+);
+
+// ─── useAuth Hook ─────────────────────────────────────────────────────────────
+function useAuth() {
+  const [user, setUser] = useState(null);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    supabase.auth.getSession().then(({ data: { session } }) => {
+      if (session?.user) setUser(formatUser(session.user));
+      setLoading(false);
+    });
+    const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
+      setUser(session?.user ? formatUser(session.user) : null);
+    });
+    return () => subscription.unsubscribe();
+  }, []);
+
+  const signUp = async (email, password, name) => {
+    const { data, error } = await supabase.auth.signUp({
+      email, password, options: { data: { name } }
+    });
+    if (error) throw error;
+    return data;
+  };
+
+  const signIn = async (email, password) => {
+    const { data, error } = await supabase.auth.signInWithPassword({ email, password });
+    if (error) throw error;
+    return data;
+  };
+
+  const signOut = async () => { await supabase.auth.signOut(); };
+
+  return { user, loading, signUp, signIn, signOut };
+}
+
+function formatUser(u) {
+  return { id: u.id, email: u.email, name: u.user_metadata?.name || u.email.split("@")[0] };
+}
+
+// ─── useHomeRoom Hook ─────────────────────────────────────────────────────────
+function useHomeRoom(userId) {
+  const [kids, setKids] = useState([]);
+  const [semester, setSemester] = useState(null);
+  const [history, setHistory] = useState([]);
+  const [dataLoading, setDataLoading] = useState(true);
+  const [setupDone, setSetupDone] = useState(false);
+
+  useEffect(() => {
+    if (!userId) { setDataLoading(false); return; }
+    loadAll();
+  }, [userId]);
+
+  const loadAll = async () => {
+    setDataLoading(true);
+    try { await Promise.all([loadKids(), loadSemester(), loadHistory()]); }
+    finally { setDataLoading(false); }
+  };
+
+  const loadKids = async () => {
+    const { data, error } = await supabase
+      .from("kids")
+      .select(`id, name, grade, learning_style, emoji, subjects(id, name, curriculum_weeks(week_number, topic, description))`)
+      .eq("user_id", userId)
+      .order("created_at");
+    if (error) { console.error("loadKids:", error); return; }
+    const shaped = (data || []).map(k => ({
+      id: k.id, name: k.name, grade: k.grade,
+      learningStyle: k.learning_style, emoji: k.emoji || "📚",
+      subjects: (k.subjects || []).map(s => s.name),
+      curriculumWeeks: (k.subjects || []).reduce((acc, s) => {
+        if (s.curriculum_weeks?.length) {
+          acc[s.name] = s.curriculum_weeks
+            .sort((a, b) => a.week_number - b.week_number)
+            .map(w => ({ week: w.week_number, topic: w.topic, description: w.description }));
+        }
+        return acc;
+      }, {}),
+      _subjectIds: (k.subjects || []).reduce((acc, s) => { acc[s.name] = s.id; return acc; }, {})
+    }));
+    setKids(shaped);
+    if (shaped.length > 0) setSetupDone(true);
+  };
+
+  const saveKid = async ({ name, grade, learningStyle, subjects, emoji = "📚" }) => {
+    const { data: kidRow, error: kidError } = await supabase
+      .from("kids").insert({ user_id: userId, name, grade, learning_style: learningStyle, emoji })
+      .select().single();
+    if (kidError) throw kidError;
+    const subjectRows = subjects.filter(s => s.trim()).map(s => ({ kid_id: kidRow.id, name: s.trim() }));
+    if (subjectRows.length) {
+      const { error } = await supabase.from("subjects").insert(subjectRows);
+      if (error) throw error;
+    }
+    await loadKids();
+    return kidRow.id;
+  };
+
+  const loadSemester = async () => {
+    const { data, error } = await supabase
+      .from("semesters").select("*").eq("user_id", userId).eq("is_active", true)
+      .order("created_at", { ascending: false }).limit(1).single();
+    if (error && error.code !== "PGRST116") { console.error("loadSemester:", error); return; }
+    if (data) { setSemester({ start: data.start_date, end: data.end_date, id: data.id }); setSetupDone(true); }
+  };
+
+  const saveSemester = async ({ start, end }) => {
+    await supabase.from("semesters").update({ is_active: false }).eq("user_id", userId).eq("is_active", true);
+    const { data, error } = await supabase
+      .from("semesters").insert({ user_id: userId, start_date: start, end_date: end, is_active: true })
+      .select().single();
+    if (error) throw error;
+    setSemester({ start: data.start_date, end: data.end_date, id: data.id });
+  };
+
+  const saveCurriculumWeeks = async ({ kidId, subject, weeks }) => {
+    const kid = kids.find(k => k.id === kidId);
+    if (!kid) throw new Error("Kid not found");
+    let subjectId = kid._subjectIds?.[subject];
+    if (!subjectId) {
+      const { data, error } = await supabase.from("subjects").insert({ kid_id: kidId, name: subject }).select().single();
+      if (error) throw error;
+      subjectId = data.id;
+    }
+    await supabase.from("curriculum_weeks").delete().eq("subject_id", subjectId);
+    const { error } = await supabase.from("curriculum_weeks").insert(
+      weeks.map(w => ({ subject_id: subjectId, week_number: w.week, topic: w.topic, description: w.description || null }))
+    );
+    if (error) throw error;
+    await loadKids();
+  };
+
+  const loadHistory = async () => {
+    const { data, error } = await supabase
+      .from("generations").select("*").eq("user_id", userId)
+      .order("created_at", { ascending: false }).limit(200);
+    if (error) { console.error("loadHistory:", error); return; }
+    setHistory((data || []).map(r => ({
+      id: r.id, toolId: r.tool_id, toolTitle: r.tool_title, toolIcon: r.tool_icon,
+      kidId: r.kid_id, kidName: r.kid_name, subject: r.subject_name,
+      topic: r.topic, content: r.content, createdAt: r.created_at
+    })));
+  };
+
+  const saveGeneration = async (entry) => {
+    const { data, error } = await supabase.from("generations").insert({
+      user_id: userId, kid_id: entry.kidId || null, kid_name: entry.kidName,
+      subject_name: entry.subject, tool_id: entry.toolId, tool_title: entry.toolTitle,
+      tool_icon: entry.toolIcon, topic: entry.topic, content: entry.content
+    }).select().single();
+    if (error) throw error;
+    setHistory(prev => [{ ...entry, id: data.id, createdAt: data.created_at }, ...prev]);
+  };
+
+  const deleteGeneration = async (id) => {
+    const { error } = await supabase.from("generations").delete().eq("id", id);
+    if (error) throw error;
+    setHistory(prev => prev.filter(h => h.id !== id));
+  };
+
+  const completeSetup = async ({ kids: newKids, semesterDates }) => {
+    for (const kid of newKids) await saveKid(kid);
+    await saveSemester(semesterDates);
+    setSetupDone(true);
+  };
+
+  return {
+    kids, semester, history, dataLoading, setupDone,
+    saveKid, saveSemester, saveCurriculumWeeks,
+    saveGeneration, deleteGeneration, completeSetup, reload: loadAll
+  };
+}
 
 // ─── Design Tokens ────────────────────────────────────────────────────────────
 const styles = `
