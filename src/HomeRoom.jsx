@@ -1834,16 +1834,12 @@ function HistoryViewer({ item, onClose, onDelete }) {
 }
 
 // ─── Dashboard ────────────────────────────────────────────────────────────────
-function Dashboard({ user, kids: initialKids, semesterDates, onAddKid, onSaveGeneration, onDeleteGeneration, onSaveCurriculum, onSignOut }) {
-  const [kids, setKids] = useState(initialKids || []);
+function Dashboard({ user, kids, semesterDates, onAddKid, onSaveGeneration, onDeleteGeneration, onSaveCurriculum, onSignOut }) {
   const [activeTool, setActiveTool] = useState(null);
   const [activeTab, setActiveTab] = useState("dashboard");
   const [history, setHistory] = useState([]);
   const [viewingItem, setViewingItem] = useState(null);
   const [historyFilter, setHistoryFilter] = useState("all");
-
-  // Keep local kids in sync when Supabase data loads
-  React.useEffect(() => { setKids(initialKids || []); }, [initialKids]);
 
   const handleSaveToHistory = async (entry) => {
     if (onSaveGeneration) {
@@ -1863,14 +1859,6 @@ function Dashboard({ user, kids: initialKids, semesterDates, onAddKid, onSaveGen
     if (onSaveCurriculum) {
       try { await onSaveCurriculum({ kidId, subject, weeks }); } catch (e) { console.error(e); }
     }
-    setKids(prev => prev.map(k => {
-      if (k.id !== kidId) return k;
-      const updatedCurriculumWeeks = { ...(k.curriculumWeeks || {}), [subject]: weeks };
-      const weekNum = semesterDates?.start ? getWeekNumber(semesterDates.start) : 1;
-      const currentWeek = weeks.find(w => w.week === weekNum) || weeks[0];
-      const updatedTopics = { ...(k.currentTopics || {}), [subject]: currentWeek?.topic || `Week ${weekNum}` };
-      return { ...k, curriculumWeeks: updatedCurriculumWeeks, currentTopics: updatedTopics };
-    }));
   };
 
   const firstName = user.name.split(" ")[0];
