@@ -187,7 +187,7 @@ function useHomeRoom(userId) {
 
 // ─── Design Tokens ────────────────────────────────────────────────────────────
 const styles = `
-  @import url('https://fonts.googleapis.com/css2?family=Caveat:wght@400;600;700&family=Playfair+Display:wght@400;600;700&family=Lato:wght@300;400;700&display=swap');
+  @import url('https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,400;0,600;1,400&family=Dancing+Script:wght@600;700&family=Lato:wght@300;400;700&display=swap');
 
   * { box-sizing: border-box; margin: 0; padding: 0; }
 
@@ -219,8 +219,8 @@ const styles = `
   }
 
   h1, h2, h3 {
-    font-family: 'Caveat', cursive;
-    letter-spacing: 0.01em;
+    font-family: 'Dancing Script', cursive;
+    letter-spacing: 0.02em;
   }
 
   /* ── Auth Screen ── */
@@ -261,18 +261,18 @@ const styles = `
   }
 
   .auth-logo h1 {
-    font-size: 2.8rem;
+    font-size: 3.4rem;
     color: var(--green);
     letter-spacing: 0.02em;
+    font-family: 'Dancing Script', cursive;
   }
 
   .auth-logo p {
-    color: var(--text-muted);
-    font-size: 0.92rem;
-    margin-top: 4px;
-    font-family: 'Caveat', cursive;
-    font-size: 1.1rem;
     color: var(--brown-light);
+    font-family: 'Cormorant Garamond', serif;
+    font-style: italic;
+    font-size: 1.15rem;
+    margin-top: 4px;
   }
 
   .auth-tabs {
@@ -406,8 +406,8 @@ const styles = `
   }
 
   .topbar-logo {
-    font-family: 'Caveat', cursive;
-    font-size: 1.9rem;
+    font-family: 'Dancing Script', cursive;
+    font-size: 2.1rem;
     color: var(--green);
     font-weight: 700;
     display: flex;
@@ -468,16 +468,17 @@ const styles = `
   }
 
   .greeting h2 {
-    font-size: 2.4rem;
+    font-size: 2.6rem;
     color: var(--text);
     margin-bottom: 4px;
+    font-family: 'Dancing Script', cursive;
   }
 
   .greeting p {
     color: var(--text-muted);
-    font-size: 1rem;
-    font-family: 'Caveat', cursive;
-    font-size: 1.15rem;
+    font-family: 'Cormorant Garamond', serif;
+    font-style: italic;
+    font-size: 1.1rem;
   }
 
   .suggestion-banner {
