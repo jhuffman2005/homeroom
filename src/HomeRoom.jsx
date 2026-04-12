@@ -1483,7 +1483,7 @@ function GenerationModal({ tool, kids, onClose, onSave }) {
   const [output, setOutput] = useState("");
   const [saved, setSaved] = useState(false);
 
-  const selectedKid = kids.find(k => String(k.id) === String(kidId));
+  const selectedKid = kids.find(k => k.id === parseInt(kidId));
   const subjects = selectedKid?.subjects || [];
 
   const generate = async () => {
@@ -1493,12 +1493,11 @@ function GenerationModal({ tool, kids, onClose, onSave }) {
     const kid = selectedKid;
     const prompt = buildPrompt(tool, kid, subject, topic);
     try {
-      const res = await fetch("https://api.anthropic.com/v1/messages", {
+      const res = await fetch("/api/generate", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          model: "claude-sonnet-4-20250514",
-          max_tokens: 1000,
+          max_tokens: 4096,
           messages: [{ role: "user", content: prompt }]
         })
       });
@@ -1602,7 +1601,7 @@ function CurriculumUploadModal({ kids, onClose, onSave }) {
   const [error, setError] = useState("");
   const fileInputRef = React.useRef();
 
-  const selectedKid = kids.find(k => String(k.id) === String(kidId));
+  const selectedKid = kids.find(k => k.id === parseInt(kidId));
   const subjects = selectedKid?.subjects || [];
 
   const handleFile = (f) => {
@@ -1668,12 +1667,11 @@ Example format:
             { type: "text", text: prompt }
           ];
 
-      const res = await fetch("https://api.anthropic.com/v1/messages", {
+      const res = await fetch("/api/generate", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          model: "claude-sonnet-4-20250514",
-          max_tokens: 1000,
+          max_tokens: 4096,
           messages: [{ role: "user", content: messageContent }]
         })
       });
