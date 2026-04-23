@@ -930,24 +930,17 @@ const styles = `
     color: #c0392b;
   }
 
-  .kid-card-edit-btn {
-    margin-top: 10px;
-    padding: 6px 12px;
-    background: var(--green-pale);
-    color: var(--green);
-    border: none;
-    border-radius: var(--radius-sm);
-    font-family: 'Lato', sans-serif;
-    font-size: 0.78rem;
+  .kid-card-hint {
+    margin-top: 8px;
+    font-size: 0.75rem;
     font-weight: 700;
-    cursor: pointer;
-    transition: all 0.15s;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    transition: color 0.15s;
   }
 
-  .kid-card-edit-btn:hover {
-    background: var(--green);
-    color: var(--white);
-  }
+  .kid-card:hover .kid-card-hint { color: var(--green); }
 
   /* ── Weekly Plan Board ── */
   .week-nav {
@@ -2875,19 +2868,14 @@ function Dashboard({ user, kids, semesterDates, lessonPlans, onAddKid, onSaveGen
             <div className="greeting"><h2>Your Students</h2></div>
             <div className="kids-row">
               {kids.map(kid => (
-                <div className="kid-card" key={kid.id} style={{ cursor: "default" }}>
+                <div className="kid-card" key={kid.id} onClick={() => setEditingScheduleKid(kid)} title="Edit schedule">
                   <div className="kid-avatar" style={{ fontSize: "1.8rem" }}>{kid.emoji}</div>
                   <h4>{kid.name}</h4>
                   <div className="grade">{kid.grade}</div>
                   <div className="subject-pills" style={{ marginBottom: 8 }}>
                     {kid.subjects.map(s => <span className="subject-pill" key={s}>{s}</span>)}
                   </div>
-                  <div style={{ marginTop: 4, fontSize: "0.78rem", fontWeight: 700, color: "var(--text-muted)", textTransform: "uppercase", letterSpacing: "0.05em" }}>
-                    Weekly Schedule
-                  </div>
-                  <button className="kid-card-edit-btn" onClick={() => setEditingScheduleKid(kid)}>
-                    ✏️ Edit Schedule
-                  </button>
+                  <div className="kid-card-hint">✏️ Edit Schedule</div>
                 </div>
               ))}
               <div className="add-kid-card" onClick={onAddKid}>
