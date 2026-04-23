@@ -57,6 +57,7 @@ function useHomeRoom(userId) {
   const [kids, setKids] = useState([]);
   const [semester, setSemester] = useState(null);
   const [history, setHistory] = useState([]);
+  const [lessonPlans, setLessonPlans] = useState([]);
   const [dataLoading, setDataLoading] = useState(true);
   const [setupDone, setSetupDone] = useState(false);
 
@@ -67,8 +68,33 @@ function useHomeRoom(userId) {
 
   const loadAll = async () => {
     setDataLoading(true);
-    try { await Promise.all([loadKids(), loadSemester(), loadHistory()]); }
+    try { await Promise.all([loadKids(), loadSemester(), loadHistory(), loadLessonPlans()]); }
     finally { setDataLoading(false); }
+  };
+
+  const loadLessonPlans = async () => {
+    const { data, error } = await supabase
+      .from("lesson_plans")
+      .select(`id, kid_id, week_start_date, created_at, kids ( name ), lesson_plan_items ( id, status )`)
+      .eq("user_id", userId)
+      .order("week_start_date", { ascending: false });
+    if (error) { console.error("loadLessonPlans:", error); return; }
+    setLessonPlans((data || []).map(p => {
+      const items = p.lesson_plan_items || [];
+      const counts = items.reduce((acc, it) => {
+        const s = it.status || "todo";
+        acc[s] = (acc[s] || 0) + 1;
+        return acc;
+      }, { todo: 0, assigned: 0, complete: 0 });
+      return {
+        id: p.id,
+        kidId: p.kid_id,
+        kidName: p.kids?.name || "Unknown",
+        weekStartDate: p.week_start_date,
+        total: items.length,
+        ...counts
+      };
+    }));
   };
 
   const loadKids = async () => {
@@ -172,6 +198,88 @@ function useHomeRoom(userId) {
     setHistory(prev => prev.filter(h => h.id !== id));
   };
 
+  const loadScheduleRules = async (kidId) => {
+    const { data, error } = await supabase
+      .from("kid_schedule_rules").select("*").eq("kid_id", kidId);
+    if (error) { console.error("loadScheduleRules:", error); return { subjectDays: {}, specialRules: [] }; }
+    const subjectDays = {};
+    const specialRules = [];
+    (data || []).forEach(r => {
+      if (r.subject === "special") specialRules.push({ text: r.notes || "" });
+      else subjectDays[r.subject] = r.days_of_week || [];
+    });
+    return { subjectDays, specialRules };
+  };
+
+  const loadLessonPlan = async ({ kidId, weekStartDate }) => {
+    const { data: plan, error: planErr } = await supabase
+      .from("lesson_plans").select("id")
+      .eq("kid_id", kidId).eq("week_start_date", weekStartDate)
+      .maybeSingle();
+    if (planErr) { console.error("loadLessonPlan plan:", planErr); return { planId: null, items: [] }; }
+    if (!plan) return { planId: null, items: [] };
+    const { data: items, error: itemsErr } = await supabase
+      .from("lesson_plan_items").select("*")
+      .eq("plan_id", plan.id).order("created_at");
+    if (itemsErr) { console.error("loadLessonPlan items:", itemsErr); return { planId: plan.id, items: [] }; }
+    return { planId: plan.id, items: items || [] };
+  };
+
+  const assignLessonPlanItem = async (itemId) => {
+    const { data, error } = await supabase
+      .from("lesson_plan_items")
+      .update({ status: "assigned", assigned_at: new Date().toISOString() })
+      .eq("id", itemId)
+      .select("status, assigned_at")
+      .single();
+    if (error) throw error;
+    loadLessonPlans();
+    return data;
+  };
+
+  const saveLessonPlan = async ({ kidId, weekStartDate, items }) => {
+    const { error: delErr } = await supabase.from("lesson_plans")
+      .delete().eq("kid_id", kidId).eq("week_start_date", weekStartDate);
+    if (delErr) throw delErr;
+    const { data: plan, error: planErr } = await supabase
+      .from("lesson_plans")
+      .insert({ user_id: userId, kid_id: kidId, week_start_date: weekStartDate })
+      .select().single();
+    if (planErr) throw planErr;
+    if (!items.length) return { planId: plan.id, items: [] };
+    const rows = items.map(it => ({
+      plan_id: plan.id,
+      day: it.day,
+      subject: it.subject || null,
+      task_title: it.task_title,
+      content: it.content || null,
+      status: "todo"
+    }));
+    const { data: inserted, error: itemsErr } = await supabase
+      .from("lesson_plan_items").insert(rows).select();
+    if (itemsErr) throw itemsErr;
+    loadLessonPlans();
+    return { planId: plan.id, items: inserted };
+  };
+
+  const saveScheduleRules = async ({ kidId, subjectDays, specialRules }) => {
+    const { error: delError } = await supabase
+      .from("kid_schedule_rules").delete().eq("kid_id", kidId);
+    if (delError) throw delError;
+    const rows = [
+      ...Object.entries(subjectDays).map(([subject, days]) => ({
+        kid_id: kidId, subject, days_of_week: days, notes: null
+      })),
+      ...specialRules.filter(r => r.text.trim()).map(r => ({
+        kid_id: kidId, subject: "special", days_of_week: [], notes: r.text.trim()
+      })),
+    ];
+    if (rows.length) {
+      const { error } = await supabase.from("kid_schedule_rules").insert(rows);
+      if (error) throw error;
+    }
+  };
+
   const completeSetup = async ({ kids: newKids, semesterDates }) => {
     for (const kid of newKids) await saveKid(kid);
     await saveSemester(semesterDates);
@@ -179,9 +287,12 @@ function useHomeRoom(userId) {
   };
 
   return {
-    kids, semester, history, dataLoading, setupDone,
+    kids, semester, history, lessonPlans, dataLoading, setupDone,
     saveKid, saveSemester, saveCurriculumWeeks,
-    saveGeneration, deleteGeneration, completeSetup, reload: loadAll
+    saveGeneration, deleteGeneration,
+    loadScheduleRules, saveScheduleRules,
+    loadLessonPlan, saveLessonPlan, assignLessonPlanItem,
+    completeSetup, reload: loadAll
   };
 }
 
@@ -721,6 +832,370 @@ const styles = `
     margin-top: 28px;
   }
 
+  /* ── Schedule Rules ── */
+  .schedule-grid {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+  }
+
+  .schedule-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 10px 12px;
+    background: var(--cream);
+    border-radius: var(--radius-sm);
+    flex-wrap: wrap;
+  }
+
+  .schedule-subject {
+    font-weight: 700;
+    color: var(--text);
+    font-size: 0.9rem;
+    flex: 1 1 140px;
+    min-width: 140px;
+  }
+
+  .schedule-days {
+    display: flex;
+    gap: 6px;
+    flex-wrap: wrap;
+  }
+
+  .day-chip {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 38px;
+    padding: 5px 8px;
+    border-radius: 14px;
+    background: var(--white);
+    border: 1.5px solid var(--cream-dark);
+    color: var(--text-muted);
+    font-size: 0.78rem;
+    font-weight: 700;
+    cursor: pointer;
+    transition: all 0.15s;
+    user-select: none;
+  }
+
+  .day-chip input { display: none; }
+
+  .day-chip.active {
+    background: var(--green);
+    border-color: var(--green);
+    color: var(--white);
+  }
+
+  .day-chip:hover { border-color: var(--green-light); }
+
+  .rule-row {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+    margin-bottom: 8px;
+  }
+
+  .rule-row input {
+    flex: 1;
+    padding: 10px 12px;
+    border: 1.5px solid var(--cream-dark);
+    border-radius: var(--radius-sm);
+    font-family: 'Lato', sans-serif;
+    font-size: 0.9rem;
+    background: var(--white);
+  }
+
+  .rule-row input:focus {
+    outline: none;
+    border-color: var(--green);
+  }
+
+  .rule-delete {
+    width: 32px;
+    height: 32px;
+    border: none;
+    background: var(--cream-dark);
+    color: var(--text-muted);
+    border-radius: 50%;
+    font-size: 1.1rem;
+    cursor: pointer;
+    transition: all 0.15s;
+  }
+
+  .rule-delete:hover {
+    background: #fde8e8;
+    color: #c0392b;
+  }
+
+  .kid-card-edit-btn {
+    margin-top: 10px;
+    padding: 6px 12px;
+    background: var(--green-pale);
+    color: var(--green);
+    border: none;
+    border-radius: var(--radius-sm);
+    font-family: 'Lato', sans-serif;
+    font-size: 0.78rem;
+    font-weight: 700;
+    cursor: pointer;
+    transition: all 0.15s;
+  }
+
+  .kid-card-edit-btn:hover {
+    background: var(--green);
+    color: var(--white);
+  }
+
+  /* ── Weekly Plan Board ── */
+  .week-nav {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+
+  .week-nav button {
+    padding: 8px 12px;
+    min-width: 36px;
+    font-size: 1rem;
+    line-height: 1;
+  }
+
+  .week-label {
+    font-weight: 700;
+    font-size: 0.9rem;
+    color: var(--text);
+    padding: 0 10px;
+    white-space: nowrap;
+  }
+
+  .week-board {
+    display: grid;
+    grid-template-columns: repeat(5, 1fr);
+    gap: 10px;
+    margin-bottom: 8px;
+  }
+
+  .week-col {
+    background: var(--cream);
+    border-radius: var(--radius-sm);
+    padding: 10px;
+    min-height: 120px;
+  }
+
+  .week-col-header {
+    text-align: center;
+    margin-bottom: 8px;
+    padding-bottom: 8px;
+    border-bottom: 1px dashed var(--cream-dark);
+  }
+
+  .week-col-day {
+    font-weight: 700;
+    font-size: 0.85rem;
+    color: var(--text);
+  }
+
+  .week-col-date {
+    font-size: 0.72rem;
+    color: var(--text-muted);
+  }
+
+  .week-col-cards {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+
+  .week-empty {
+    text-align: center;
+    color: var(--text-muted);
+    font-size: 0.8rem;
+    opacity: 0.5;
+    padding: 16px 0;
+  }
+
+  .plan-card {
+    background: var(--white);
+    border-radius: 8px;
+    padding: 8px 10px;
+    box-shadow: 0 1px 3px rgba(60,40,20,0.06);
+    border: 1px solid transparent;
+    transition: all 0.15s;
+  }
+
+  .plan-card:hover {
+    border-color: var(--green-light);
+  }
+
+  .plan-card-subject {
+    font-size: 0.68rem;
+    color: var(--green);
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    margin-bottom: 2px;
+  }
+
+  .plan-card-title {
+    font-size: 0.82rem;
+    color: var(--text);
+    font-weight: 600;
+    line-height: 1.3;
+    margin-bottom: 6px;
+  }
+
+  .status-badge {
+    display: inline-block;
+    font-size: 0.62rem;
+    padding: 2px 7px;
+    border-radius: 10px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+  }
+
+  .status-todo { background: var(--cream-dark); color: var(--text-muted); }
+  .status-assigned { background: #FFF4D6; color: #8A6D00; }
+  .status-complete { background: var(--green-pale); color: var(--green); }
+
+  .plan-card-footer {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 6px;
+    flex-wrap: wrap;
+  }
+
+  .assign-btn {
+    background: transparent;
+    border: 1.5px solid var(--green);
+    color: var(--green);
+    padding: 3px 9px;
+    border-radius: 12px;
+    font-size: 0.68rem;
+    font-weight: 700;
+    cursor: pointer;
+    font-family: 'Lato', sans-serif;
+    transition: all 0.15s;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    white-space: nowrap;
+  }
+
+  .assign-btn:hover {
+    background: var(--green);
+    color: var(--white);
+  }
+
+  @media (max-width: 760px) {
+    .week-board { grid-template-columns: 1fr; }
+  }
+
+  /* ── Assignment Page (public) ── */
+  .assign-wrap {
+    min-height: 100vh;
+    background: linear-gradient(135deg, #EAF2EC 0%, #FAF7F2 50%, #F0EBE1 100%);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 20px;
+  }
+
+  .assign-card {
+    background: var(--white);
+    border-radius: 24px;
+    padding: 40px 32px;
+    width: 100%;
+    max-width: 540px;
+    box-shadow: var(--shadow-lg);
+    animation: fadeUp 0.4s ease;
+  }
+
+  .assign-logo {
+    text-align: center;
+    color: var(--green);
+    font-family: 'Dancing Script', cursive;
+    font-size: 1.8rem;
+    margin-bottom: 24px;
+    letter-spacing: 0.02em;
+  }
+
+  .assign-meta {
+    display: flex;
+    gap: 8px;
+    flex-wrap: wrap;
+    margin-bottom: 12px;
+  }
+
+  .assign-day, .assign-subject {
+    background: var(--green-pale);
+    color: var(--green);
+    border-radius: 14px;
+    padding: 4px 12px;
+    font-size: 0.78rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+  }
+
+  .assign-title {
+    font-family: 'Cormorant Garamond', serif;
+    font-size: 2rem;
+    color: var(--text);
+    line-height: 1.2;
+    margin-bottom: 20px;
+    letter-spacing: 0.01em;
+  }
+
+  .assign-content {
+    font-size: 1.05rem;
+    line-height: 1.65;
+    color: var(--text);
+    background: var(--cream);
+    border-radius: var(--radius-sm);
+    padding: 20px 22px;
+    margin-bottom: 28px;
+    white-space: pre-wrap;
+  }
+
+  .assign-complete-btn {
+    width: 100%;
+    padding: 18px;
+    font-size: 1.1rem;
+    border-radius: var(--radius-sm);
+  }
+
+  .assign-done {
+    text-align: center;
+    padding: 30px 0;
+  }
+
+  .assign-done-icon {
+    font-size: 3.6rem;
+    margin-bottom: 12px;
+  }
+
+  .assign-done h2 {
+    font-family: 'Dancing Script', cursive;
+    color: var(--green);
+    font-size: 2.2rem;
+    margin-bottom: 8px;
+  }
+
+  .assign-done p {
+    color: var(--text-muted);
+    font-size: 1rem;
+  }
+
+  @media (max-width: 540px) {
+    .assign-card { padding: 28px 22px; }
+    .assign-title { font-size: 1.6rem; }
+    .assign-content { font-size: 0.98rem; padding: 16px 18px; }
+  }
+
   /* ── Setup Flow ── */
   .setup-wrap {
     min-height: 100vh;
@@ -1200,6 +1675,67 @@ const styles = `
     margin-bottom: 8px;
   }
 
+  .history-segmented {
+    display: inline-flex;
+    background: var(--cream-dark);
+    border-radius: var(--radius-sm);
+    padding: 4px;
+    margin-bottom: 20px;
+    gap: 2px;
+  }
+
+  .history-segmented button {
+    padding: 8px 18px;
+    border: none;
+    background: transparent;
+    border-radius: 6px;
+    font-family: 'Lato', sans-serif;
+    font-size: 0.86rem;
+    font-weight: 700;
+    color: var(--text-muted);
+    cursor: pointer;
+    transition: all 0.2s;
+  }
+
+  .history-segmented button.active {
+    background: var(--white);
+    color: var(--green);
+    box-shadow: 0 1px 4px rgba(60,40,20,0.08);
+  }
+
+  .history-segmented button:hover:not(.active) { color: var(--text); }
+
+  .plan-progress {
+    display: flex;
+    gap: 12px;
+    flex-wrap: wrap;
+    margin-top: 6px;
+    margin-bottom: 8px;
+    font-size: 0.78rem;
+    font-weight: 700;
+  }
+
+  .plan-count-complete { color: var(--green); }
+  .plan-count-assigned { color: #8A6D00; }
+  .plan-count-todo { color: var(--text-muted); }
+
+  .plan-progress-bar {
+    display: flex;
+    height: 6px;
+    border-radius: 3px;
+    overflow: hidden;
+    background: var(--cream-dark);
+  }
+
+  .plan-progress-seg {
+    height: 100%;
+    transition: width 0.3s;
+  }
+
+  .seg-complete { background: var(--green); }
+  .seg-assigned { background: #F4C430; }
+  .seg-todo { background: var(--cream-dark); }
+
   /* ── History Viewer Modal ── */
   .viewer-modal {
     background: var(--white);
@@ -1269,6 +1805,7 @@ const LEARNING_STYLES = [
 ];
 
 const TOOLS = [
+  { id: "weeklyplan", icon: "📆", title: "Weekly Plan", desc: "Auto-generate this week's Mon-Fri schedule" },
   { id: "lesson", icon: "📋", title: "Lesson Plan", desc: "Full weekly lesson plan for any subject" },
   { id: "worksheet", icon: "✏️", title: "Worksheet", desc: "Practice problems & activities" },
   { id: "quiz", icon: "🎯", title: "Quiz or Test", desc: "Assessment for any topic" },
@@ -1796,6 +2333,375 @@ Example format:
   );
 }
 
+// ─── Weekly Plan Modal ───────────────────────────────────────────────────────
+const DAY_NAMES = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"];
+const DAY_ABBR = ["Mon", "Tue", "Wed", "Thu", "Fri"];
+
+function getMondayOf(date) {
+  const d = new Date(date);
+  d.setHours(0, 0, 0, 0);
+  const day = d.getDay();
+  const diff = day === 0 ? -6 : 1 - day;
+  d.setDate(d.getDate() + diff);
+  return d;
+}
+
+function addDays(d, n) {
+  const x = new Date(d);
+  x.setDate(x.getDate() + n);
+  return x;
+}
+
+function fmtMonthDay(d) {
+  return d.toLocaleDateString("en-US", { month: "short", day: "numeric" });
+}
+
+function isoLocalDate(d) {
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
+}
+
+function buildWeeklyPlanPrompt(kid, subjectDays, specialRules, weekDates) {
+  const subjectLines = (kid.subjects || []).map(s => {
+    const days = subjectDays[s];
+    const dayList = (days && days.length) ? days.join(", ") : DAY_ABBR.join(", ");
+    return `- ${s}: ${dayList}`;
+  }).join("\n") || "(no subjects on file)";
+
+  const rulesText = specialRules.length
+    ? specialRules.map(r => `- ${r.text}`).join("\n")
+    : "(none)";
+
+  const dateLines = weekDates.map((d, i) => `${DAY_NAMES[i]} (${fmtMonthDay(d)})`).join(", ");
+
+  return `You are creating a weekly homeschool plan for ${kid.name}, grade ${kid.grade}, learning style: ${kid.learningStyle || "general"}.
+
+Week (Mon-Fri): ${dateLines}
+
+Subjects and their teaching days (Mon=Monday, Tue=Tuesday, etc.):
+${subjectLines}
+
+Special rules (must be respected — they override the subject schedule):
+${rulesText}
+
+Generate one assignment per subject per scheduled day, respecting all special rules. If a special rule says no academic work on a day, generate no items for that day.
+
+Return ONLY a JSON array with no markdown, no preamble, no backticks. Each item must have:
+- day: string (one of "Monday", "Tuesday", "Wednesday", "Thursday", "Friday")
+- subject: string (matching one of the subjects above)
+- task_title: string (short title, max 8 words)
+- content: string (full assignment description, 2-3 sentences)
+
+Example:
+[{"day":"Monday","subject":"Math","task_title":"Adding fractions","content":"Complete pages 12-14 of the Saxon workbook. Focus on adding fractions with unlike denominators and check answers in the back."}]`;
+}
+
+function WeeklyPlanModal({ kids, onClose, onLoadScheduleRules, onLoadPlan, onSavePlan, onAssignItem, initialKidId, initialWeekStart }) {
+  const [kidId, setKidId] = useState(initialKidId || kids[0]?.id || "");
+  const [weekStart, setWeekStart] = useState(() =>
+    initialWeekStart ? getMondayOf(new Date(initialWeekStart + "T00:00:00")) : getMondayOf(new Date())
+  );
+  const [items, setItems] = useState([]);
+  const [generating, setGenerating] = useState(false);
+  const [loadingExisting, setLoadingExisting] = useState(false);
+  const [error, setError] = useState("");
+  const [copiedId, setCopiedId] = useState(null);
+
+  const selectedKid = kids.find(k => String(k.id) === String(kidId));
+  const weekDates = [0, 1, 2, 3, 4].map(i => addDays(weekStart, i));
+  const isoStart = isoLocalDate(weekStart);
+
+  useEffect(() => {
+    if (!kidId) return;
+    let cancelled = false;
+    setLoadingExisting(true);
+    setError("");
+    onLoadPlan({ kidId, weekStartDate: isoStart }).then(({ items: existing }) => {
+      if (cancelled) return;
+      setItems(existing || []);
+      setLoadingExisting(false);
+    }).catch(e => {
+      if (cancelled) return;
+      console.error(e);
+      setLoadingExisting(false);
+    });
+    return () => { cancelled = true; };
+  }, [kidId, isoStart]);
+
+  const handleGenerate = async () => {
+    if (!selectedKid) return;
+    setGenerating(true);
+    setError("");
+    try {
+      const { subjectDays, specialRules } = await onLoadScheduleRules(selectedKid.id);
+      const prompt = buildWeeklyPlanPrompt(selectedKid, subjectDays, specialRules, weekDates);
+
+      const res = await fetch("/api/generate", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          max_tokens: 4096,
+          messages: [{ role: "user", content: prompt }]
+        })
+      });
+      const data = await res.json();
+      const raw = data.content?.map(b => b.text || "").join("") || "";
+      const clean = raw.replace(/```json|```/g, "").trim();
+      const parsed = JSON.parse(clean);
+      if (!Array.isArray(parsed)) throw new Error("Response was not a JSON array");
+
+      const { items: saved } = await onSavePlan({
+        kidId: selectedKid.id,
+        weekStartDate: isoStart,
+        items: parsed
+      });
+      setItems(saved || []);
+    } catch (e) {
+      console.error(e);
+      setError("Couldn't generate the plan. Please try again.");
+    } finally {
+      setGenerating(false);
+    }
+  };
+
+  const handleAssign = async (item) => {
+    if (!item.assignment_token) return;
+    const url = `https://homeroom.pro/a/${item.assignment_token}`;
+    try {
+      if (item.status === "todo") {
+        const updated = await onAssignItem(item.id);
+        setItems(prev => prev.map(i => i.id === item.id
+          ? { ...i, status: updated.status, assigned_at: updated.assigned_at }
+          : i));
+      }
+      await navigator.clipboard.writeText(url);
+      setCopiedId(item.id);
+      setTimeout(() => setCopiedId(curr => curr === item.id ? null : curr), 2000);
+    } catch (e) {
+      console.error(e);
+      alert("Couldn't copy link. Please try again.");
+    }
+  };
+
+  const itemsByDay = DAY_NAMES.reduce((acc, d) => { acc[d] = []; return acc; }, {});
+  items.forEach(it => { if (itemsByDay[it.day]) itemsByDay[it.day].push(it); });
+
+  return (
+    <div className="modal-overlay" onClick={e => e.target === e.currentTarget && onClose()}>
+      <div className="modal" style={{ maxWidth: 1000 }}>
+        <h2>📆 Weekly Plan</h2>
+        <p className="subtitle">Generate a Mon-Fri schedule that respects the kid's subjects and special rules.</p>
+
+        <div style={{ display: "flex", gap: 12, alignItems: "flex-end", marginBottom: 20, flexWrap: "wrap" }}>
+          <div className="form-group" style={{ marginBottom: 0, flex: "1 1 200px", minWidth: 200 }}>
+            <label>Student</label>
+            <select value={kidId} onChange={e => setKidId(e.target.value)}>
+              {kids.map(k => <option key={k.id} value={k.id}>{k.name} — {k.grade}</option>)}
+            </select>
+          </div>
+
+          <div className="week-nav">
+            <button className="btn-secondary" onClick={() => setWeekStart(addDays(weekStart, -7))} title="Previous week">‹</button>
+            <div className="week-label">{fmtMonthDay(weekStart)} – {fmtMonthDay(weekDates[4])}</div>
+            <button className="btn-secondary" onClick={() => setWeekStart(addDays(weekStart, 7))} title="Next week">›</button>
+          </div>
+
+          <button
+            className="btn-primary"
+            style={{ width: "auto", padding: "10px 20px" }}
+            onClick={handleGenerate}
+            disabled={generating || !kidId}
+          >
+            {generating ? "Generating..." : items.length ? "Regenerate" : "Generate Plan"}
+          </button>
+        </div>
+
+        {error && (
+          <div style={{ background: "#fde8e8", color: "#c0392b", borderRadius: 8, padding: "10px 14px", fontSize: "0.85rem", marginBottom: 16 }}>
+            ⚠️ {error}
+          </div>
+        )}
+
+        {loadingExisting ? (
+          <p style={{ color: "var(--text-muted)" }}>Loading...</p>
+        ) : (
+          <div className="week-board">
+            {DAY_NAMES.map((dayName, i) => (
+              <div className="week-col" key={dayName}>
+                <div className="week-col-header">
+                  <div className="week-col-day">{DAY_ABBR[i]}</div>
+                  <div className="week-col-date">{fmtMonthDay(weekDates[i])}</div>
+                </div>
+                <div className="week-col-cards">
+                  {itemsByDay[dayName].length === 0 && <div className="week-empty">—</div>}
+                  {itemsByDay[dayName].map((item, idx) => (
+                    <div className="plan-card" key={item.id || `${dayName}-${idx}`}>
+                      {item.subject && <div className="plan-card-subject">{item.subject}</div>}
+                      <div className="plan-card-title">{item.task_title}</div>
+                      <div className="plan-card-footer">
+                        <span className={`status-badge status-${item.status || "todo"}`}>
+                          {item.status || "todo"}
+                        </span>
+                        {item.assignment_token && item.status !== "complete" && (
+                          <button
+                            className="assign-btn"
+                            onClick={() => handleAssign(item)}
+                            title={item.status === "assigned" ? "Copy link" : "Assign and copy link"}
+                          >
+                            {copiedId === item.id
+                              ? "✓ Copied!"
+                              : item.status === "assigned" ? "Copy Link" : "Assign"}
+                          </button>
+                        )}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+
+        <div className="modal-footer">
+          <button className="btn-secondary" onClick={onClose}>Close</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── Schedule Rules Modal ─────────────────────────────────────────────────────
+const SCHEDULE_DAYS = ["Mon", "Tue", "Wed", "Thu", "Fri"];
+
+function ScheduleRulesModal({ kid, onClose, onLoad, onSave }) {
+  const [subjectDays, setSubjectDays] = useState(
+    Object.fromEntries((kid.subjects || []).map(s => [s, [...SCHEDULE_DAYS]]))
+  );
+  const [specialRules, setSpecialRules] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      const { subjectDays: loaded, specialRules: loadedRules } = await onLoad(kid.id);
+      if (cancelled) return;
+      setSubjectDays(
+        Object.fromEntries(
+          (kid.subjects || []).map(s => [s, loaded[s] ?? [...SCHEDULE_DAYS]])
+        )
+      );
+      setSpecialRules(loadedRules);
+      setLoading(false);
+    })();
+    return () => { cancelled = true; };
+  }, [kid.id]);
+
+  const toggleDay = (subject, day) => {
+    setSubjectDays(prev => {
+      const days = prev[subject] || [];
+      const next = days.includes(day) ? days.filter(d => d !== day) : [...days, day];
+      return { ...prev, [subject]: next };
+    });
+  };
+
+  const updateRule = (idx, text) =>
+    setSpecialRules(prev => prev.map((r, i) => i === idx ? { ...r, text } : r));
+  const addRule = () => setSpecialRules(prev => [...prev, { text: "" }]);
+  const deleteRule = (idx) => setSpecialRules(prev => prev.filter((_, i) => i !== idx));
+
+  const handleSave = async () => {
+    setSaving(true);
+    try {
+      await onSave({ kidId: kid.id, subjectDays, specialRules });
+      onClose();
+    } catch (e) {
+      console.error(e);
+      alert("Couldn't save schedule. Please try again.");
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <div className="modal-overlay" onClick={e => e.target === e.currentTarget && onClose()}>
+      <div className="modal" style={{ maxWidth: 580 }}>
+        <h2>📅 {kid.name}'s Weekly Schedule</h2>
+        <p className="subtitle">Pick which days each subject is taught and add any special rules.</p>
+
+        {loading ? (
+          <p style={{ color: "var(--text-muted)" }}>Loading...</p>
+        ) : (
+          <>
+            <div className="form-group">
+              <label>Subject Schedule</label>
+              {(kid.subjects || []).length === 0 ? (
+                <p style={{ color: "var(--text-muted)", fontSize: "0.85rem" }}>
+                  No subjects yet — add some to {kid.name}'s profile first.
+                </p>
+              ) : (
+                <div className="schedule-grid">
+                  {kid.subjects.map(s => (
+                    <div className="schedule-row" key={s}>
+                      <div className="schedule-subject">{s}</div>
+                      <div className="schedule-days">
+                        {SCHEDULE_DAYS.map(d => {
+                          const checked = subjectDays[s]?.includes(d);
+                          return (
+                            <label className={`day-chip ${checked ? "active" : ""}`} key={d}>
+                              <input type="checkbox" checked={!!checked} onChange={() => toggleDay(s, d)} />
+                              {d}
+                            </label>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+
+            <div className="form-group">
+              <label>Special Rules</label>
+              {specialRules.length === 0 && (
+                <p style={{ color: "var(--text-muted)", fontSize: "0.82rem", marginBottom: 8 }}>
+                  e.g. "Thursdays are Mock Trial — no academic assignments"
+                </p>
+              )}
+              {specialRules.map((r, i) => (
+                <div className="rule-row" key={i}>
+                  <input
+                    type="text"
+                    value={r.text}
+                    onChange={e => updateRule(i, e.target.value)}
+                    placeholder="Add a rule..."
+                  />
+                  <button className="rule-delete" onClick={() => deleteRule(i)} title="Delete rule">×</button>
+                </div>
+              ))}
+              <button className="btn-secondary" style={{ marginTop: 4 }} onClick={addRule}>+ Add Rule</button>
+            </div>
+          </>
+        )}
+
+        <div className="modal-footer">
+          <button className="btn-secondary" onClick={onClose} disabled={saving}>Cancel</button>
+          <button
+            className="btn-primary"
+            style={{ width: "auto", padding: "10px 24px" }}
+            onClick={handleSave}
+            disabled={loading || saving}
+          >
+            {saving ? "Saving..." : "Save Schedule"}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // ─── History Viewer Modal ─────────────────────────────────────────────────────
 function HistoryViewer({ item, onClose, onDelete }) {
   const handlePrint = () => {
@@ -1835,12 +2741,15 @@ function HistoryViewer({ item, onClose, onDelete }) {
 }
 
 // ─── Dashboard ────────────────────────────────────────────────────────────────
-function Dashboard({ user, kids, semesterDates, onAddKid, onSaveGeneration, onDeleteGeneration, onSaveCurriculum, onSignOut }) {
+function Dashboard({ user, kids, semesterDates, lessonPlans, onAddKid, onSaveGeneration, onDeleteGeneration, onSaveCurriculum, onLoadScheduleRules, onSaveScheduleRules, onLoadLessonPlan, onSaveLessonPlan, onAssignLessonPlanItem, onSignOut }) {
   const [activeTool, setActiveTool] = useState(null);
   const [activeTab, setActiveTab] = useState("dashboard");
   const [history, setHistory] = useState([]);
   const [viewingItem, setViewingItem] = useState(null);
   const [historyFilter, setHistoryFilter] = useState("all");
+  const [historyView, setHistoryView] = useState("plans");
+  const [openingPlan, setOpeningPlan] = useState(null);
+  const [editingScheduleKid, setEditingScheduleKid] = useState(null);
 
   const handleSaveToHistory = async (entry) => {
     if (onSaveGeneration) {
@@ -1973,6 +2882,12 @@ function Dashboard({ user, kids, semesterDates, onAddKid, onSaveGeneration, onDe
                   <div className="subject-pills" style={{ marginBottom: 8 }}>
                     {kid.subjects.map(s => <span className="subject-pill" key={s}>{s}</span>)}
                   </div>
+                  <div style={{ marginTop: 4, fontSize: "0.78rem", fontWeight: 700, color: "var(--text-muted)", textTransform: "uppercase", letterSpacing: "0.05em" }}>
+                    Weekly Schedule
+                  </div>
+                  <button className="kid-card-edit-btn" onClick={() => setEditingScheduleKid(kid)}>
+                    ✏️ Edit Schedule
+                  </button>
                 </div>
               ))}
               <div className="add-kid-card" onClick={onAddKid}>
@@ -2008,7 +2923,6 @@ function Dashboard({ user, kids, semesterDates, onAddKid, onSaveGeneration, onDe
           ];
           const filtered = historyFilter === "all" ? history : history.filter(h => h.toolId === historyFilter);
 
-          // Group by date
           const grouped = filtered.reduce((acc, item) => {
             const dateKey = new Date(item.createdAt).toLocaleDateString("en-US", { weekday: "long", month: "long", day: "numeric" });
             if (!acc[dateKey]) acc[dateKey] = [];
@@ -2016,57 +2930,118 @@ function Dashboard({ user, kids, semesterDates, onAddKid, onSaveGeneration, onDe
             return acc;
           }, {});
 
+          const pct = (n, total) => total ? `${(n / total) * 100}%` : "0%";
+
           return (
             <>
-              <div className="greeting">
-                <h2>Generation History</h2>
-                <p>{history.length === 0 ? "Your generated materials will appear here." : `${history.length} item${history.length !== 1 ? "s" : ""} saved this semester.`}</p>
+              <div className="greeting"><h2>History</h2></div>
+
+              <div className="history-segmented">
+                <button
+                  className={historyView === "plans" ? "active" : ""}
+                  onClick={() => setHistoryView("plans")}
+                >📆 Weekly Plans</button>
+                <button
+                  className={historyView === "materials" ? "active" : ""}
+                  onClick={() => setHistoryView("materials")}
+                >📋 Generated Materials</button>
               </div>
 
-              {history.length > 0 && (
-                <div className="history-filters">
-                  {TOOL_FILTERS.map(f => (
-                    <button key={f.id} className={`filter-chip ${historyFilter === f.id ? "active" : ""}`}
-                      onClick={() => setHistoryFilter(f.id)}>{f.label}</button>
-                  ))}
-                </div>
-              )}
-
-              {filtered.length === 0 && (
-                <div className="empty-state">
-                  <div className="empty-icon">{history.length === 0 ? "🗂️" : "🔍"}</div>
-                  <h3>{history.length === 0 ? "Nothing generated yet" : "No results"}</h3>
-                  <p>{history.length === 0
-                    ? "Head to Generate and create your first worksheet, quiz, or lesson plan."
-                    : "Try a different filter."}</p>
-                  {history.length === 0 && (
-                    <button className="btn-primary" style={{ width: "auto", marginTop: 16, padding: "10px 24px" }}
-                      onClick={() => setActiveTab("generate")}>Generate Something →</button>
+              {historyView === "plans" && (
+                <>
+                  {lessonPlans.length === 0 && (
+                    <div className="empty-state">
+                      <div className="empty-icon">📆</div>
+                      <h3>No weekly plans yet</h3>
+                      <p>Generate one from the Weekly Plan tool to see it here.</p>
+                      <button className="btn-primary" style={{ width: "auto", marginTop: 16, padding: "10px 24px" }}
+                        onClick={() => { setActiveTab("generate"); }}>Go to Generate →</button>
+                    </div>
                   )}
-                </div>
+
+                  <div className="history-list">
+                    {lessonPlans.map(p => {
+                      const monday = new Date(p.weekStartDate + "T00:00:00");
+                      const friday = new Date(monday);
+                      friday.setDate(monday.getDate() + 4);
+                      const fmt = d => d.toLocaleDateString("en-US", { month: "short", day: "numeric" });
+                      return (
+                        <div className="history-card" key={p.id} onClick={() => {
+                          setOpeningPlan({ kidId: p.kidId, weekStartDate: p.weekStartDate });
+                          setActiveTool({ id: "weeklyplan", icon: "📆", title: "Weekly Plan" });
+                        }}>
+                          <div className="history-type-badge">📆</div>
+                          <div className="history-meta">
+                            <h4>{p.kidName} — Week of {fmt(monday)}</h4>
+                            <div className="history-sub">{fmt(monday)} – {fmt(friday)}, {monday.getFullYear()}</div>
+                            <div className="plan-progress">
+                              <span className="plan-count plan-count-complete">{p.complete}/{p.total} complete</span>
+                              <span className="plan-count plan-count-assigned">{p.assigned}/{p.total} assigned</span>
+                              <span className="plan-count plan-count-todo">{p.todo}/{p.total} to do</span>
+                            </div>
+                            {p.total > 0 && (
+                              <div className="plan-progress-bar">
+                                <div className="plan-progress-seg seg-complete" style={{ width: pct(p.complete, p.total) }} />
+                                <div className="plan-progress-seg seg-assigned" style={{ width: pct(p.assigned, p.total) }} />
+                                <div className="plan-progress-seg seg-todo" style={{ width: pct(p.todo, p.total) }} />
+                              </div>
+                            )}
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </>
               )}
 
-              {Object.entries(grouped).map(([date, items]) => (
-                <div key={date}>
-                  <div className="history-date-divider">{date}</div>
-                  <div className="history-list">
-                    {items.map(item => (
-                      <div className="history-card" key={item.id} onClick={() => setViewingItem(item)}>
-                        <div className="history-type-badge">{item.toolIcon}</div>
-                        <div className="history-meta">
-                          <h4>{item.toolTitle}: {item.topic}</h4>
-                          <div className="history-sub">{item.kidName} · {item.subject}</div>
-                          <div className="history-preview">{item.content}</div>
-                        </div>
-                        <div className="history-actions" onClick={e => e.stopPropagation()}>
-                          <button className="icon-btn" title="View" onClick={() => setViewingItem(item)}>👁️</button>
-                          <button className="icon-btn danger" title="Delete" onClick={() => handleDeleteFromHistory(item.id)}>🗑️</button>
-                        </div>
+              {historyView === "materials" && (
+                <>
+                  {history.length > 0 && (
+                    <div className="history-filters">
+                      {TOOL_FILTERS.map(f => (
+                        <button key={f.id} className={`filter-chip ${historyFilter === f.id ? "active" : ""}`}
+                          onClick={() => setHistoryFilter(f.id)}>{f.label}</button>
+                      ))}
+                    </div>
+                  )}
+
+                  {filtered.length === 0 && (
+                    <div className="empty-state">
+                      <div className="empty-icon">{history.length === 0 ? "🗂️" : "🔍"}</div>
+                      <h3>{history.length === 0 ? "Nothing generated yet" : "No results"}</h3>
+                      <p>{history.length === 0
+                        ? "Head to Generate and create your first worksheet, quiz, or lesson plan."
+                        : "Try a different filter."}</p>
+                      {history.length === 0 && (
+                        <button className="btn-primary" style={{ width: "auto", marginTop: 16, padding: "10px 24px" }}
+                          onClick={() => setActiveTab("generate")}>Generate Something →</button>
+                      )}
+                    </div>
+                  )}
+
+                  {Object.entries(grouped).map(([date, items]) => (
+                    <div key={date}>
+                      <div className="history-date-divider">{date}</div>
+                      <div className="history-list">
+                        {items.map(item => (
+                          <div className="history-card" key={item.id} onClick={() => setViewingItem(item)}>
+                            <div className="history-type-badge">{item.toolIcon}</div>
+                            <div className="history-meta">
+                              <h4>{item.toolTitle}: {item.topic}</h4>
+                              <div className="history-sub">{item.kidName} · {item.subject}</div>
+                              <div className="history-preview">{item.content}</div>
+                            </div>
+                            <div className="history-actions" onClick={e => e.stopPropagation()}>
+                              <button className="icon-btn" title="View" onClick={() => setViewingItem(item)}>👁️</button>
+                              <button className="icon-btn danger" title="Delete" onClick={() => handleDeleteFromHistory(item.id)}>🗑️</button>
+                            </div>
+                          </div>
+                        ))}
                       </div>
-                    ))}
-                  </div>
-                </div>
-              ))}
+                    </div>
+                  ))}
+                </>
+              )}
             </>
           );
         })()}
@@ -2077,6 +3052,17 @@ function Dashboard({ user, kids, semesterDates, onAddKid, onSaveGeneration, onDe
           kids={kids}
           onClose={() => setActiveTool(null)}
           onSave={handleCurriculumSave}
+        />
+      ) : activeTool?.id === "weeklyplan" ? (
+        <WeeklyPlanModal
+          kids={kids}
+          onClose={() => { setActiveTool(null); setOpeningPlan(null); }}
+          onLoadScheduleRules={onLoadScheduleRules}
+          onLoadPlan={onLoadLessonPlan}
+          onSavePlan={onSaveLessonPlan}
+          onAssignItem={onAssignLessonPlanItem}
+          initialKidId={openingPlan?.kidId}
+          initialWeekStart={openingPlan?.weekStartDate}
         />
       ) : activeTool ? (
         <GenerationModal tool={activeTool} kids={kids} onClose={() => setActiveTool(null)} onSave={handleSaveToHistory} />
@@ -2089,17 +3075,128 @@ function Dashboard({ user, kids, semesterDates, onAddKid, onSaveGeneration, onDe
           onDelete={handleDeleteFromHistory}
         />
       )}
+
+      {editingScheduleKid && (
+        <ScheduleRulesModal
+          kid={editingScheduleKid}
+          onClose={() => setEditingScheduleKid(null)}
+          onLoad={onLoadScheduleRules}
+          onSave={onSaveScheduleRules}
+        />
+      )}
+    </div>
+  );
+}
+
+// ─── Assignment Page (public, no auth) ───────────────────────────────────────
+function AssignmentPage({ token }) {
+  const [item, setItem] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
+  const [completing, setCompleting] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      const { data, error: fetchError } = await supabase
+        .from("lesson_plan_items")
+        .select("id, day, subject, task_title, content, status, assignment_token")
+        .eq("assignment_token", token)
+        .maybeSingle();
+      if (cancelled) return;
+      if (fetchError || !data) {
+        setError("This assignment link doesn't seem to work. Double-check it with your teacher.");
+      } else {
+        setItem(data);
+      }
+      setLoading(false);
+    })();
+    return () => { cancelled = true; };
+  }, [token]);
+
+  const markComplete = async () => {
+    setCompleting(true);
+    try {
+      const { error: updateError } = await supabase
+        .from("lesson_plan_items")
+        .update({ status: "complete", completed_at: new Date().toISOString() })
+        .eq("assignment_token", token);
+      if (updateError) throw updateError;
+      setItem(prev => ({ ...prev, status: "complete" }));
+    } catch (e) {
+      console.error(e);
+      alert("Couldn't save. Please try again.");
+    } finally {
+      setCompleting(false);
+    }
+  };
+
+  return (
+    <div className="assign-wrap">
+      <div className="assign-card">
+        <div className="assign-logo">🏫 HomeRoom</div>
+
+        {loading && <p style={{ color: "var(--text-muted)", textAlign: "center" }}>Loading...</p>}
+
+        {error && (
+          <div style={{ textAlign: "center", padding: "20px 0" }}>
+            <div style={{ fontSize: "2.4rem", marginBottom: 12 }}>🤔</div>
+            <p style={{ color: "var(--text-muted)" }}>{error}</p>
+          </div>
+        )}
+
+        {item && item.status === "complete" && (
+          <div className="assign-done">
+            <div className="assign-done-icon">🎉</div>
+            <h2>Great work!</h2>
+            <p>Your teacher has been notified.</p>
+          </div>
+        )}
+
+        {item && item.status !== "complete" && (
+          <>
+            <div className="assign-meta">
+              {item.day && <span className="assign-day">{item.day}</span>}
+              {item.subject && <span className="assign-subject">{item.subject}</span>}
+            </div>
+            <h1 className="assign-title">{item.task_title}</h1>
+            {item.content && <div className="assign-content">{item.content}</div>}
+            <button
+              className="btn-primary assign-complete-btn"
+              onClick={markComplete}
+              disabled={completing}
+            >
+              {completing ? "Saving..." : "Mark Complete ✓"}
+            </button>
+          </>
+        )}
+      </div>
     </div>
   );
 }
 
 // ─── App Root ─────────────────────────────────────────────────────────────────
 export default function HomeRoom() {
+  // Public assignment route — render before any auth/data hooks fire
+  const path = typeof window !== "undefined" ? window.location.pathname : "";
+  const assignMatch = path.match(/^\/a\/([^/?#]+)\/?$/);
+  if (assignMatch) {
+    return (
+      <>
+        <style>{styles}</style>
+        <AssignmentPage token={assignMatch[1]} />
+      </>
+    );
+  }
+
   const { user, loading: authLoading, signIn, signUp, signOut } = useAuth();
   const {
-    kids, semester, history, dataLoading, setupDone,
+    kids, semester, history, lessonPlans, dataLoading, setupDone,
     saveKid, saveSemester, saveCurriculumWeeks,
-    saveGeneration, deleteGeneration, completeSetup
+    saveGeneration, deleteGeneration,
+    loadScheduleRules, saveScheduleRules,
+    loadLessonPlan, saveLessonPlan, assignLessonPlanItem,
+    completeSetup
   } = useHomeRoom(user?.id);
 
   // Loading spinner while checking auth session
@@ -2134,9 +3231,15 @@ export default function HomeRoom() {
         kids={kids}
         semesterDates={semester}
         history={history}
+        lessonPlans={lessonPlans}
         onSaveGeneration={saveGeneration}
         onDeleteGeneration={deleteGeneration}
         onSaveCurriculum={({ kidId, subject, weeks }) => saveCurriculumWeeks({ kidId, subject, weeks })}
+        onLoadScheduleRules={loadScheduleRules}
+        onSaveScheduleRules={saveScheduleRules}
+        onLoadLessonPlan={loadLessonPlan}
+        onSaveLessonPlan={saveLessonPlan}
+        onAssignLessonPlanItem={assignLessonPlanItem}
         onSignOut={signOut}
         onAddKid={saveKid}
       />
