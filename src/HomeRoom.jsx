@@ -100,14 +100,22 @@ function useHomeRoom(userId) {
   const loadKids = async () => {
     const { data, error } = await supabase
       .from("kids")
-      .select(`id, name, grade, learning_style, emoji, subjects(id, name, curriculum_weeks(week_number, topic, description))`)
+      .select(`id, name, grade, learning_style, emoji, avatar_url, subjects(id, name, book_title, book_link, curriculum_weeks(week_number, topic, description))`)
       .eq("user_id", userId)
       .order("created_at");
     if (error) { console.error("loadKids:", error); return; }
     const shaped = (data || []).map(k => ({
       id: k.id, name: k.name, grade: k.grade,
       learningStyle: k.learning_style, emoji: k.emoji || "📚",
+      avatarUrl: k.avatar_url || null,
       subjects: (k.subjects || []).map(s => s.name),
+      subjectDetails: (k.subjects || []).map(s => ({
+        id: s.id,
+        name: s.name,
+        bookTitle: s.book_title || "",
+        bookLink: s.book_link || "",
+        weekCount: s.curriculum_weeks?.length || 0,
+      })),
       curriculumWeeks: (k.subjects || []).reduce((acc, s) => {
         if (s.curriculum_weeks?.length) {
           acc[s.name] = s.curriculum_weeks
@@ -116,10 +124,61 @@ function useHomeRoom(userId) {
         }
         return acc;
       }, {}),
+      books: (k.subjects || []).reduce((acc, s) => {
+        if (s.book_title || s.book_link) {
+          acc[s.name] = { title: s.book_title || "", link: s.book_link || "" };
+        }
+        return acc;
+      }, {}),
       _subjectIds: (k.subjects || []).reduce((acc, s) => { acc[s.name] = s.id; return acc; }, {})
     }));
     setKids(shaped);
     if (shaped.length > 0) setSetupDone(true);
+  };
+
+  const updateKid = async ({ kidId, name, grade, learningStyle, emoji, avatarUrl }) => {
+    const updates = {};
+    if (name !== undefined) updates.name = name;
+    if (grade !== undefined) updates.grade = grade;
+    if (learningStyle !== undefined) updates.learning_style = learningStyle;
+    if (emoji !== undefined) updates.emoji = emoji;
+    if (avatarUrl !== undefined) updates.avatar_url = avatarUrl;
+    const { error } = await supabase.from("kids").update(updates).eq("id", kidId);
+    if (error) throw error;
+    await loadKids();
+  };
+
+  const addSubjectToKid = async ({ kidId, name }) => {
+    const { error } = await supabase.from("subjects").insert({ kid_id: kidId, name: name.trim() });
+    if (error) throw error;
+    await loadKids();
+  };
+
+  const deleteSubject = async (subjectId) => {
+    const { error } = await supabase.from("subjects").delete().eq("id", subjectId);
+    if (error) throw error;
+    await loadKids();
+  };
+
+  const updateSubjectResources = async ({ subjectId, bookTitle, bookLink }) => {
+    const { error } = await supabase
+      .from("subjects")
+      .update({ book_title: bookTitle || null, book_link: bookLink || null })
+      .eq("id", subjectId);
+    if (error) throw error;
+    await loadKids();
+  };
+
+  const uploadKidAvatar = async ({ kidId, file }) => {
+    const ext = (file.name.split(".").pop() || "jpg").toLowerCase();
+    const path = `${userId}/${kidId}-${Date.now()}.${ext}`;
+    const { error: uploadErr } = await supabase.storage
+      .from("avatars")
+      .upload(path, file, { upsert: true, contentType: file.type });
+    if (uploadErr) throw uploadErr;
+    const { data: { publicUrl } } = supabase.storage.from("avatars").getPublicUrl(path);
+    await updateKid({ kidId, avatarUrl: publicUrl });
+    return publicUrl;
   };
 
   const saveKid = async ({ name, grade, learningStyle, subjects, emoji = "📚" }) => {
@@ -225,6 +284,55 @@ function useHomeRoom(userId) {
     return { planId: plan.id, items: items || [] };
   };
 
+  // Drop a generated material into a kid's weekly plan on a specific weekday.
+  // Creates the plan if none exists for that week.
+  const assignGenerationToPlan = async ({ kidId, date, generation }) => {
+    const d = new Date(date + "T00:00:00");
+    const dow = d.getDay(); // 0=Sun..6=Sat
+    if (dow === 0 || dow === 6) throw new Error("Pick a weekday (Mon-Fri)");
+    const dayName = DAY_NAMES[dow - 1];
+    const monday = getMondayOf(d);
+    const weekStartDate = isoLocalDate(monday);
+
+    const { data: existing, error: findErr } = await supabase
+      .from("lesson_plans").select("id")
+      .eq("kid_id", kidId).eq("week_start_date", weekStartDate)
+      .maybeSingle();
+    if (findErr) throw findErr;
+
+    let planId = existing?.id;
+    if (!planId) {
+      const { data: created, error: createErr } = await supabase
+        .from("lesson_plans")
+        .insert({ user_id: userId, kid_id: kidId, week_start_date: weekStartDate })
+        .select().single();
+      if (createErr) throw createErr;
+      planId = created.id;
+    }
+
+    const title = generation.toolTitle && generation.topic
+      ? `${generation.toolTitle}: ${generation.topic}`
+      : (generation.topic || generation.toolTitle || "Assignment");
+
+    const { data: item, error: itemErr } = await supabase
+      .from("lesson_plan_items")
+      .insert({
+        plan_id: planId,
+        day: dayName,
+        subject: generation.subject || null,
+        task_title: title,
+        content: generation.content || null,
+        status: "assigned",
+        assigned_at: new Date().toISOString()
+      })
+      .select("id, assignment_token, status, day, task_title")
+      .single();
+    if (itemErr) throw itemErr;
+
+    loadLessonPlans();
+    return item;
+  };
+
   const assignLessonPlanItem = async (itemId) => {
     const { data, error } = await supabase
       .from("lesson_plan_items")
@@ -292,6 +400,8 @@ function useHomeRoom(userId) {
     saveGeneration, deleteGeneration,
     loadScheduleRules, saveScheduleRules,
     loadLessonPlan, saveLessonPlan, assignLessonPlanItem,
+    assignGenerationToPlan,
+    updateKid, addSubjectToKid, deleteSubject, updateSubjectResources, uploadKidAvatar,
     completeSetup, reload: loadAll
   };
 }
@@ -930,24 +1040,17 @@ const styles = `
     color: #c0392b;
   }
 
-  .kid-card-edit-btn {
-    margin-top: 10px;
-    padding: 6px 12px;
-    background: var(--green-pale);
-    color: var(--green);
-    border: none;
-    border-radius: var(--radius-sm);
-    font-family: 'Lato', sans-serif;
-    font-size: 0.78rem;
+  .kid-card-hint {
+    margin-top: 8px;
+    font-size: 0.75rem;
     font-weight: 700;
-    cursor: pointer;
-    transition: all 0.15s;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    transition: color 0.15s;
   }
 
-  .kid-card-edit-btn:hover {
-    background: var(--green);
-    color: var(--white);
-  }
+  .kid-card:hover .kid-card-hint { color: var(--green); }
 
   /* ── Weekly Plan Board ── */
   .week-nav {
@@ -1736,6 +1839,196 @@ const styles = `
   .seg-assigned { background: #F4C430; }
   .seg-todo { background: var(--cream-dark); }
 
+  /* ── Assign to Plan ── */
+  .assign-to-plan {
+    background: var(--green-pale);
+    border-radius: var(--radius-sm);
+    padding: 14px 16px;
+    margin: 18px 0;
+    border: 1px dashed var(--green-light);
+  }
+
+  .assign-to-plan-label {
+    font-size: 0.78rem;
+    font-weight: 700;
+    color: var(--green);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    margin-bottom: 8px;
+  }
+
+  .assign-to-plan-row {
+    display: flex;
+    gap: 10px;
+    align-items: center;
+    flex-wrap: wrap;
+  }
+
+  .assign-to-plan-row input[type="date"] {
+    padding: 9px 12px;
+    border: 1.5px solid var(--cream-dark);
+    border-radius: var(--radius-sm);
+    font-family: 'Lato', sans-serif;
+    font-size: 0.9rem;
+    background: var(--white);
+    color: var(--text);
+    flex: 1 1 160px;
+    min-width: 0;
+  }
+
+  .assign-to-plan-row input[type="date"]:focus {
+    outline: none;
+    border-color: var(--green);
+  }
+
+  .assign-to-plan-error {
+    margin-top: 8px;
+    font-size: 0.8rem;
+    color: #c0392b;
+    font-weight: 700;
+  }
+
+  /* ── Student Profile Modal ── */
+  .profile-section {
+    border-top: 1px solid var(--cream-dark);
+    padding-top: 18px;
+    margin-top: 18px;
+  }
+
+  .profile-section:first-of-type {
+    border-top: none;
+    padding-top: 0;
+    margin-top: 0;
+  }
+
+  .profile-section-title {
+    font-family: 'Dancing Script', cursive;
+    font-size: 1.4rem;
+    color: var(--green);
+    margin-bottom: 14px;
+    letter-spacing: 0.02em;
+  }
+
+  .profile-avatar-row {
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    margin-bottom: 16px;
+  }
+
+  .profile-avatar-display {
+    width: 76px;
+    height: 76px;
+    border-radius: 18px;
+    background: var(--green-pale);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    overflow: hidden;
+    flex-shrink: 0;
+    border: 2px solid var(--cream-dark);
+  }
+
+  .profile-avatar-display img {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+  }
+
+  .profile-avatar-actions {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+
+  .emoji-row {
+    display: flex;
+    gap: 6px;
+    flex-wrap: wrap;
+  }
+
+  .emoji-btn {
+    width: 36px;
+    height: 36px;
+    border: 1.5px solid var(--cream-dark);
+    background: var(--white);
+    border-radius: 10px;
+    font-size: 1.1rem;
+    cursor: pointer;
+    transition: all 0.15s;
+    padding: 0;
+  }
+
+  .emoji-btn:hover {
+    border-color: var(--green-light);
+    transform: scale(1.05);
+  }
+
+  .emoji-btn.active {
+    background: var(--green-pale);
+    border-color: var(--green);
+  }
+
+  .subject-block {
+    background: var(--cream);
+    border-radius: var(--radius-sm);
+    padding: 12px 14px;
+    margin-bottom: 10px;
+  }
+
+  .subject-block-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 10px;
+  }
+
+  .subject-block-header h4 {
+    font-size: 1rem;
+    font-weight: 700;
+    color: var(--text);
+  }
+
+  .subject-block-fields {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 10px;
+  }
+
+  @media (max-width: 600px) {
+    .subject-block-fields { grid-template-columns: 1fr; }
+  }
+
+  .subject-block-curr {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-top: 8px;
+    padding-top: 8px;
+    border-top: 1px dashed var(--cream-dark);
+  }
+
+  .add-subject-row {
+    display: flex;
+    gap: 8px;
+    margin-top: 12px;
+  }
+
+  .add-subject-row input {
+    flex: 1;
+    padding: 10px 12px;
+    border: 1.5px solid var(--cream-dark);
+    border-radius: var(--radius-sm);
+    font-family: 'Lato', sans-serif;
+    font-size: 0.9rem;
+    background: var(--white);
+  }
+
+  .add-subject-row input:focus {
+    outline: none;
+    border-color: var(--green);
+  }
+
   /* ── History Viewer Modal ── */
   .viewer-modal {
     background: var(--white);
@@ -1811,7 +2104,6 @@ const TOOLS = [
   { id: "quiz", icon: "🎯", title: "Quiz or Test", desc: "Assessment for any topic" },
   { id: "essay", icon: "📝", title: "Essay Feedback", desc: "Upload & get AI grading" },
   { id: "studyguide", icon: "🗂️", title: "Study Guide", desc: "Summarize & organize any topic" },
-  { id: "curriculum", icon: "📅", title: "Upload Curriculum", desc: "Add a semester scope & sequence" },
 ];
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -2013,7 +2305,67 @@ function SetupFlow({ user, onComplete }) {
 }
 
 // ─── Generation Modal ─────────────────────────────────────────────────────────
-function GenerationModal({ tool, kids, onClose, onSave }) {
+// Default to today if it's a weekday, else snap to the upcoming Monday.
+function defaultAssignDate() {
+  const d = new Date();
+  const dow = d.getDay();
+  if (dow === 0) d.setDate(d.getDate() + 1);
+  else if (dow === 6) d.setDate(d.getDate() + 2);
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const dd = String(d.getDate()).padStart(2, "0");
+  return `${y}-${m}-${dd}`;
+}
+
+// Reusable Assign-to-Plan UI used by GenerationModal and HistoryViewer.
+function AssignToPlanRow({ kidId, kidName, getEntry, onAssignToPlan }) {
+  const [date, setDate] = useState(defaultAssignDate);
+  const [state, setState] = useState("idle");
+  const [errMsg, setErrMsg] = useState("");
+
+  const handleAssign = async () => {
+    if (!kidId) { setErrMsg("Pick a student first"); setState("error"); return; }
+    if (!date) { setErrMsg("Pick a date"); setState("error"); return; }
+    const dow = new Date(date + "T00:00:00").getDay();
+    if (dow === 0 || dow === 6) { setErrMsg("Pick a weekday (Mon-Fri)"); setState("error"); return; }
+
+    setState("working");
+    setErrMsg("");
+    try {
+      const item = await onAssignToPlan({ kidId, date, generation: getEntry() });
+      const url = `https://homeroom.pro/a/${item.assignment_token}`;
+      await navigator.clipboard.writeText(url);
+      setState("copied");
+      setTimeout(() => setState(curr => curr === "copied" ? "idle" : curr), 2500);
+    } catch (e) {
+      console.error(e);
+      setErrMsg(e.message || "Couldn't assign");
+      setState("error");
+    }
+  };
+
+  return (
+    <div className="assign-to-plan">
+      <div className="assign-to-plan-label">Assign to {kidName || "student"}</div>
+      <div className="assign-to-plan-row">
+        <input type="date" value={date} onChange={e => setDate(e.target.value)} />
+        <button
+          className="btn-primary"
+          style={{ width: "auto", padding: "10px 18px" }}
+          onClick={handleAssign}
+          disabled={state === "working"}
+        >
+          {state === "working" ? "Saving..."
+            : state === "copied" ? "✓ Link copied!"
+            : "Assign & Copy Link"}
+        </button>
+      </div>
+      {state === "error" && <div className="assign-to-plan-error">⚠️ {errMsg}</div>}
+    </div>
+  );
+}
+
+function GenerationModal({ tool, kids, onClose, onSave, onAssignToPlan }) {
   const [kidId, setKidId] = useState(kids[0]?.id || "");
   const [subject, setSubject] = useState("");
   const [topic, setTopic] = useState("");
@@ -2110,6 +2462,20 @@ function GenerationModal({ tool, kids, onClose, onSave }) {
           <div className="output-box">{output}</div>
         )}
 
+        {output && onAssignToPlan && (
+          <AssignToPlanRow
+            kidId={kidId}
+            kidName={selectedKid?.name}
+            getEntry={() => ({
+              toolTitle: tool.title,
+              subject,
+              topic,
+              content: output,
+            })}
+            onAssignToPlan={onAssignToPlan}
+          />
+        )}
+
         <div className="modal-footer">
           <button className="btn-secondary" onClick={onClose}>Close</button>
           {output && (
@@ -2129,9 +2495,11 @@ function GenerationModal({ tool, kids, onClose, onSave }) {
 }
 
 // ─── Curriculum Upload Modal ──────────────────────────────────────────────────
-function CurriculumUploadModal({ kids, onClose, onSave }) {
-  const [kidId, setKidId] = useState(kids[0]?.id || "");
-  const [subject, setSubject] = useState("");
+function CurriculumUploadModal({ kids, onClose, onSave, initialKidId, initialSubject }) {
+  const lockKid = !!initialKidId;
+  const lockSubject = !!initialSubject;
+  const [kidId, setKidId] = useState(initialKidId || kids[0]?.id || "");
+  const [subject, setSubject] = useState(initialSubject || "");
   const [file, setFile] = useState(null);
   const [dragOver, setDragOver] = useState(false);
   const [parsing, setParsing] = useState(false);
@@ -2241,20 +2609,31 @@ Example format:
         <h2>📅 Upload Curriculum</h2>
         <p className="subtitle">Upload a scope & sequence or curriculum guide — HomeRoom will learn exactly what to cover each week.</p>
 
-        <div className="form-group">
-          <label>Student</label>
-          <select value={kidId} onChange={e => { setKidId(e.target.value); setSubject(""); setWeeks(null); }}>
-            {kids.map(k => <option key={k.id} value={k.id}>{k.name} — {k.grade}</option>)}
-          </select>
-        </div>
+        {!lockKid && (
+          <div className="form-group">
+            <label>Student</label>
+            <select value={kidId} onChange={e => { setKidId(e.target.value); setSubject(""); setWeeks(null); }}>
+              {kids.map(k => <option key={k.id} value={k.id}>{k.name} — {k.grade}</option>)}
+            </select>
+          </div>
+        )}
 
-        <div className="form-group">
-          <label>Subject</label>
-          <select value={subject} onChange={e => { setSubject(e.target.value); setWeeks(null); }}>
-            <option value="">Select subject...</option>
-            {subjects.map(s => <option key={s} value={s}>{s}</option>)}
-          </select>
-        </div>
+        {!lockSubject && (
+          <div className="form-group">
+            <label>Subject</label>
+            <select value={subject} onChange={e => { setSubject(e.target.value); setWeeks(null); }}>
+              <option value="">Select subject...</option>
+              {subjects.map(s => <option key={s} value={s}>{s}</option>)}
+            </select>
+          </div>
+        )}
+
+        {(lockKid || lockSubject) && (
+          <div className="form-group" style={{ background: "var(--cream)", borderRadius: "var(--radius-sm)", padding: "10px 14px", marginBottom: 16 }}>
+            <div style={{ fontSize: "0.78rem", color: "var(--text-muted)", fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.05em", marginBottom: 4 }}>Uploading for</div>
+            <div style={{ fontSize: "0.95rem", fontWeight: 700 }}>{selectedKid?.name} — {subject}</div>
+          </div>
+        )}
 
         {!file ? (
           <div
@@ -2363,11 +2742,31 @@ function isoLocalDate(d) {
   return `${y}-${m}-${day}`;
 }
 
-function buildWeeklyPlanPrompt(kid, subjectDays, specialRules, weekDates) {
+function buildWeeklyPlanPrompt(kid, subjectDays, specialRules, weekDates, semester) {
+  // Pick the curriculum week for this calendar week, if a semester is set.
+  // Use the week containing weekDates[0] (Monday).
+  const weekNumber = semester?.start
+    ? Math.max(1, Math.floor((weekDates[0] - new Date(semester.start + "T00:00:00")) / (7 * 86400000)) + 1)
+    : null;
+
   const subjectLines = (kid.subjects || []).map(s => {
     const days = subjectDays[s];
     const dayList = (days && days.length) ? days.join(", ") : DAY_ABBR.join(", ");
-    return `- ${s}: ${dayList}`;
+    const book = kid.books?.[s];
+    const curriculum = kid.curriculumWeeks?.[s];
+    const currentWeek = (curriculum && weekNumber)
+      ? curriculum.find(w => w.week === weekNumber)
+      : null;
+
+    let line = `- ${s}: scheduled ${dayList}`;
+    if (book?.title) line += `\n    Book/Resource: ${book.title}${book.link ? ` (${book.link})` : ""}`;
+    if (currentWeek) {
+      line += `\n    This week's curriculum (Week ${currentWeek.week}): ${currentWeek.topic}`;
+      if (currentWeek.description) line += ` — ${currentWeek.description}`;
+    } else if (curriculum?.length) {
+      line += `\n    Curriculum on file (${curriculum.length} weeks). Pick the most appropriate topic for this week.`;
+    }
+    return line;
   }).join("\n") || "(no subjects on file)";
 
   const rulesText = specialRules.length
@@ -2378,27 +2777,29 @@ function buildWeeklyPlanPrompt(kid, subjectDays, specialRules, weekDates) {
 
   return `You are creating a weekly homeschool plan for ${kid.name}, grade ${kid.grade}, learning style: ${kid.learningStyle || "general"}.
 
-Week (Mon-Fri): ${dateLines}
+Week (Mon-Fri): ${dateLines}${weekNumber ? `\nCurriculum week #: ${weekNumber}` : ""}
 
-Subjects and their teaching days (Mon=Monday, Tue=Tuesday, etc.):
+Subjects, teaching days, books, and curriculum coverage:
 ${subjectLines}
 
 Special rules (must be respected — they override the subject schedule):
 ${rulesText}
 
-Generate one assignment per subject per scheduled day, respecting all special rules. If a special rule says no academic work on a day, generate no items for that day.
+Ground each day's assignment in the book/curriculum coverage listed above. If a subject has a specific "This week's curriculum" topic, the assignment should cover that topic. Reference the book by name when relevant. If a special rule says no academic work on a day, generate no items for that day.
+
+Generate one assignment per subject per scheduled day, respecting all special rules.
 
 Return ONLY a JSON array with no markdown, no preamble, no backticks. Each item must have:
 - day: string (one of "Monday", "Tuesday", "Wednesday", "Thursday", "Friday")
 - subject: string (matching one of the subjects above)
 - task_title: string (short title, max 8 words)
-- content: string (full assignment description, 2-3 sentences)
+- content: string (full assignment description, 2-3 sentences, citing book pages or curriculum topic when available)
 
 Example:
-[{"day":"Monday","subject":"Math","task_title":"Adding fractions","content":"Complete pages 12-14 of the Saxon workbook. Focus on adding fractions with unlike denominators and check answers in the back."}]`;
+[{"day":"Monday","subject":"Math","task_title":"Adding fractions","content":"Saxon Math 7/6 — Lesson 12 (pp. 45-48). Practice adding fractions with unlike denominators and check answers in the back."}]`;
 }
 
-function WeeklyPlanModal({ kids, onClose, onLoadScheduleRules, onLoadPlan, onSavePlan, onAssignItem, initialKidId, initialWeekStart }) {
+function WeeklyPlanModal({ kids, semester, onClose, onLoadScheduleRules, onLoadPlan, onSavePlan, onAssignItem, initialKidId, initialWeekStart }) {
   const [kidId, setKidId] = useState(initialKidId || kids[0]?.id || "");
   const [weekStart, setWeekStart] = useState(() =>
     initialWeekStart ? getMondayOf(new Date(initialWeekStart + "T00:00:00")) : getMondayOf(new Date())
@@ -2436,7 +2837,7 @@ function WeeklyPlanModal({ kids, onClose, onLoadScheduleRules, onLoadPlan, onSav
     setError("");
     try {
       const { subjectDays, specialRules } = await onLoadScheduleRules(selectedKid.id);
-      const prompt = buildWeeklyPlanPrompt(selectedKid, subjectDays, specialRules, weekDates);
+      const prompt = buildWeeklyPlanPrompt(selectedKid, subjectDays, specialRules, weekDates, semester);
 
       const res = await fetch("/api/generate", {
         method: "POST",
@@ -2572,32 +2973,93 @@ function WeeklyPlanModal({ kids, onClose, onLoadScheduleRules, onLoadPlan, onSav
   );
 }
 
-// ─── Schedule Rules Modal ─────────────────────────────────────────────────────
+// ─── Student Profile Modal ───────────────────────────────────────────────────
 const SCHEDULE_DAYS = ["Mon", "Tue", "Wed", "Thu", "Fri"];
+const EMOJI_OPTIONS = ["📚","✏️","🌟","🎨","🔬","🚀","🦄","🐶","🐱","🦊","🐼","🌈","⚽","🎵","🧩","🌻"];
 
-function ScheduleRulesModal({ kid, onClose, onLoad, onSave }) {
-  const [subjectDays, setSubjectDays] = useState(
-    Object.fromEntries((kid.subjects || []).map(s => [s, [...SCHEDULE_DAYS]]))
-  );
+function StudentProfileModal({
+  kid, onClose,
+  onUpdateKid, onAddSubject, onDeleteSubject, onUpdateSubjectResources, onUploadAvatar,
+  onLoadScheduleRules, onSaveScheduleRules,
+  onLaunchCurriculumUpload,
+}) {
+  const [name, setName] = useState(kid.name);
+  const [grade, setGrade] = useState(kid.grade);
+  const [learningStyle, setLearningStyle] = useState(kid.learningStyle || "");
+  const [emoji, setEmoji] = useState(kid.emoji);
+  const [avatarUrl, setAvatarUrl] = useState(kid.avatarUrl);
+  const [uploadingAvatar, setUploadingAvatar] = useState(false);
+
+  const [bookEdits, setBookEdits] = useState(() => {
+    const m = {};
+    (kid.subjectDetails || []).forEach(s => { m[s.id] = { title: s.bookTitle, link: s.bookLink }; });
+    return m;
+  });
+  const [newSubject, setNewSubject] = useState("");
+
+  const [subjectDays, setSubjectDays] = useState({});
   const [specialRules, setSpecialRules] = useState([]);
-  const [loading, setLoading] = useState(true);
+  const [scheduleLoading, setScheduleLoading] = useState(true);
   const [saving, setSaving] = useState(false);
 
+  // Load schedule rules
   useEffect(() => {
     let cancelled = false;
     (async () => {
-      const { subjectDays: loaded, specialRules: loadedRules } = await onLoad(kid.id);
+      const { subjectDays: loaded, specialRules: loadedRules } = await onLoadScheduleRules(kid.id);
       if (cancelled) return;
-      setSubjectDays(
-        Object.fromEntries(
-          (kid.subjects || []).map(s => [s, loaded[s] ?? [...SCHEDULE_DAYS]])
-        )
-      );
+      setSubjectDays(Object.fromEntries(
+        (kid.subjects || []).map(s => [s, loaded[s] ?? [...SCHEDULE_DAYS]])
+      ));
       setSpecialRules(loadedRules);
-      setLoading(false);
+      setScheduleLoading(false);
     })();
     return () => { cancelled = true; };
   }, [kid.id]);
+
+  // Sync local edits when kid is reloaded after subject add/delete/curriculum upload
+  const subjectsKey = (kid.subjects || []).join("|");
+  useEffect(() => {
+    setBookEdits(prev => {
+      const next = {};
+      (kid.subjectDetails || []).forEach(s => {
+        next[s.id] = prev[s.id] || { title: s.bookTitle, link: s.bookLink };
+      });
+      return next;
+    });
+    setSubjectDays(prev => {
+      const next = {};
+      (kid.subjects || []).forEach(s => { next[s] = prev[s] ?? [...SCHEDULE_DAYS]; });
+      return next;
+    });
+  }, [subjectsKey]);
+
+  const handleAvatarUpload = async (file) => {
+    setUploadingAvatar(true);
+    try {
+      const url = await onUploadAvatar({ kidId: kid.id, file });
+      setAvatarUrl(url);
+    } catch (e) {
+      console.error(e);
+      alert("Couldn't upload photo. Please try again.");
+    }
+    setUploadingAvatar(false);
+  };
+
+  const handleAddSubject = async () => {
+    const trimmed = newSubject.trim();
+    if (!trimmed) return;
+    try {
+      await onAddSubject({ kidId: kid.id, name: trimmed });
+      setNewSubject("");
+    } catch (e) { console.error(e); alert("Couldn't add subject."); }
+  };
+
+  const handleDeleteSubject = async (subjectId, subjectName) => {
+    if (!window.confirm(`Delete "${subjectName}"? Curriculum and schedule for it will also be removed.`)) return;
+    try { await onDeleteSubject(subjectId); }
+    catch (e) { console.error(e); alert("Couldn't delete."); }
+  };
 
   const toggleDay = (subject, day) => {
     setSubjectDays(prev => {
@@ -2612,35 +3074,144 @@ function ScheduleRulesModal({ kid, onClose, onLoad, onSave }) {
   const addRule = () => setSpecialRules(prev => [...prev, { text: "" }]);
   const deleteRule = (idx) => setSpecialRules(prev => prev.filter((_, i) => i !== idx));
 
-  const handleSave = async () => {
+  const handleSaveAll = async () => {
     setSaving(true);
     try {
-      await onSave({ kidId: kid.id, subjectDays, specialRules });
+      await onUpdateKid({ kidId: kid.id, name, grade, learningStyle, emoji, avatarUrl });
+      for (const s of (kid.subjectDetails || [])) {
+        const edit = bookEdits[s.id];
+        if (edit && (edit.title !== s.bookTitle || edit.link !== s.bookLink)) {
+          await onUpdateSubjectResources({ subjectId: s.id, bookTitle: edit.title, bookLink: edit.link });
+        }
+      }
+      await onSaveScheduleRules({ kidId: kid.id, subjectDays, specialRules });
       onClose();
     } catch (e) {
       console.error(e);
-      alert("Couldn't save schedule. Please try again.");
-    } finally {
-      setSaving(false);
+      alert("Couldn't save profile. Please try again.");
     }
+    setSaving(false);
   };
 
   return (
     <div className="modal-overlay" onClick={e => e.target === e.currentTarget && onClose()}>
-      <div className="modal" style={{ maxWidth: 580 }}>
-        <h2>📅 {kid.name}'s Weekly Schedule</h2>
-        <p className="subtitle">Pick which days each subject is taught and add any special rules.</p>
+      <div className="modal" style={{ maxWidth: 680 }}>
+        <h2>{kid.name}'s Profile</h2>
+        <p className="subtitle">Basic info, subjects & curriculum, and weekly schedule — all in one place.</p>
 
-        {loading ? (
-          <p style={{ color: "var(--text-muted)" }}>Loading...</p>
-        ) : (
-          <>
+        {/* PROFILE */}
+        <div className="profile-section">
+          <h3 className="profile-section-title">Profile</h3>
+
+          <div className="profile-avatar-row">
+            <div className="profile-avatar-display">
+              {avatarUrl
+                ? <img src={avatarUrl} alt={name} />
+                : <span style={{ fontSize: "2.6rem" }}>{emoji}</span>}
+            </div>
+            <div className="profile-avatar-actions">
+              <label className="btn-secondary" style={{ cursor: "pointer" }}>
+                {uploadingAvatar ? "Uploading..." : "📷 Upload Photo"}
+                <input type="file" accept="image/*" style={{ display: "none" }}
+                  disabled={uploadingAvatar}
+                  onChange={e => e.target.files[0] && handleAvatarUpload(e.target.files[0])} />
+              </label>
+              {avatarUrl && (
+                <button className="btn-ghost" style={{ padding: "6px 12px", fontSize: "0.82rem" }}
+                  onClick={() => setAvatarUrl(null)}>Remove photo</button>
+              )}
+            </div>
+          </div>
+
+          {!avatarUrl && (
             <div className="form-group">
-              <label>Subject Schedule</label>
+              <label>Avatar emoji</label>
+              <div className="emoji-row">
+                {EMOJI_OPTIONS.map(e => (
+                  <button type="button" key={e}
+                    className={`emoji-btn ${emoji === e ? "active" : ""}`}
+                    onClick={() => setEmoji(e)}>{e}</button>
+                ))}
+              </div>
+            </div>
+          )}
+
+          <div className="form-group">
+            <label>Name</label>
+            <input value={name} onChange={e => setName(e.target.value)} />
+          </div>
+          <div className="form-group">
+            <label>Grade</label>
+            <select value={grade} onChange={e => setGrade(e.target.value)}>
+              {GRADE_OPTIONS.map(g => <option key={g} value={g}>{g}</option>)}
+            </select>
+          </div>
+          <div className="form-group">
+            <label>Learning Style</label>
+            <select value={learningStyle} onChange={e => setLearningStyle(e.target.value)}>
+              <option value="">Pick one...</option>
+              {LEARNING_STYLES.map(s => <option key={s.id} value={s.id}>{s.emoji} {s.name}</option>)}
+            </select>
+          </div>
+        </div>
+
+        {/* SUBJECTS & CURRICULUM */}
+        <div className="profile-section">
+          <h3 className="profile-section-title">Subjects & Curriculum</h3>
+          {(kid.subjectDetails || []).length === 0 && (
+            <p style={{ color: "var(--text-muted)", fontSize: "0.85rem" }}>No subjects yet. Add one below.</p>
+          )}
+          {(kid.subjectDetails || []).map(s => {
+            const edit = bookEdits[s.id] || { title: "", link: "" };
+            return (
+              <div className="subject-block" key={s.id}>
+                <div className="subject-block-header">
+                  <h4>{s.name}</h4>
+                  <button className="rule-delete" onClick={() => handleDeleteSubject(s.id, s.name)} title="Delete subject">×</button>
+                </div>
+                <div className="subject-block-fields">
+                  <div className="form-group" style={{ marginBottom: 8 }}>
+                    <label style={{ fontSize: "0.72rem" }}>Book / Resource Title</label>
+                    <input placeholder="e.g. Saxon Math 7/6"
+                      value={edit.title}
+                      onChange={e => setBookEdits(prev => ({ ...prev, [s.id]: { ...edit, title: e.target.value } }))} />
+                  </div>
+                  <div className="form-group" style={{ marginBottom: 8 }}>
+                    <label style={{ fontSize: "0.72rem" }}>Link</label>
+                    <input placeholder="https://..."
+                      value={edit.link}
+                      onChange={e => setBookEdits(prev => ({ ...prev, [s.id]: { ...edit, link: e.target.value } }))} />
+                  </div>
+                </div>
+                <div className="subject-block-curr">
+                  <span style={{ fontSize: "0.82rem", color: s.weekCount > 0 ? "var(--green)" : "var(--text-muted)", fontWeight: 700 }}>
+                    {s.weekCount > 0 ? `📅 ${s.weekCount} weeks of curriculum loaded` : "No curriculum yet"}
+                  </span>
+                  <button className="btn-ghost" style={{ padding: "6px 12px", fontSize: "0.78rem" }}
+                    onClick={() => onLaunchCurriculumUpload({ kidId: kid.id, subject: s.name })}>
+                    {s.weekCount > 0 ? "Replace" : "Upload"}
+                  </button>
+                </div>
+              </div>
+            );
+          })}
+          <div className="add-subject-row">
+            <input placeholder="Add a subject..." value={newSubject}
+              onChange={e => setNewSubject(e.target.value)}
+              onKeyDown={e => e.key === "Enter" && handleAddSubject()} />
+            <button className="btn-secondary" onClick={handleAddSubject}>+ Add</button>
+          </div>
+        </div>
+
+        {/* SCHEDULE */}
+        <div className="profile-section">
+          <h3 className="profile-section-title">Weekly Schedule</h3>
+          {scheduleLoading ? (
+            <p style={{ color: "var(--text-muted)" }}>Loading...</p>
+          ) : (
+            <>
               {(kid.subjects || []).length === 0 ? (
-                <p style={{ color: "var(--text-muted)", fontSize: "0.85rem" }}>
-                  No subjects yet — add some to {kid.name}'s profile first.
-                </p>
+                <p style={{ color: "var(--text-muted)", fontSize: "0.85rem" }}>Add subjects above to set their schedule.</p>
               ) : (
                 <div className="schedule-grid">
                   {kid.subjects.map(s => (
@@ -2661,40 +3232,30 @@ function ScheduleRulesModal({ kid, onClose, onLoad, onSave }) {
                   ))}
                 </div>
               )}
-            </div>
-
-            <div className="form-group">
-              <label>Special Rules</label>
-              {specialRules.length === 0 && (
-                <p style={{ color: "var(--text-muted)", fontSize: "0.82rem", marginBottom: 8 }}>
-                  e.g. "Thursdays are Mock Trial — no academic assignments"
-                </p>
-              )}
-              {specialRules.map((r, i) => (
-                <div className="rule-row" key={i}>
-                  <input
-                    type="text"
-                    value={r.text}
-                    onChange={e => updateRule(i, e.target.value)}
-                    placeholder="Add a rule..."
-                  />
-                  <button className="rule-delete" onClick={() => deleteRule(i)} title="Delete rule">×</button>
-                </div>
-              ))}
-              <button className="btn-secondary" style={{ marginTop: 4 }} onClick={addRule}>+ Add Rule</button>
-            </div>
-          </>
-        )}
+              <div style={{ marginTop: 16 }}>
+                <label style={{ fontSize: "0.85rem", fontWeight: 700, color: "var(--text)", marginBottom: 6, display: "block" }}>Special Rules</label>
+                {specialRules.length === 0 && (
+                  <p style={{ color: "var(--text-muted)", fontSize: "0.78rem", marginBottom: 6 }}>
+                    e.g. "Thursdays are Mock Trial — no academic assignments"
+                  </p>
+                )}
+                {specialRules.map((r, i) => (
+                  <div className="rule-row" key={i}>
+                    <input type="text" value={r.text} onChange={e => updateRule(i, e.target.value)} placeholder="Add a rule..." />
+                    <button className="rule-delete" onClick={() => deleteRule(i)} title="Delete rule">×</button>
+                  </div>
+                ))}
+                <button className="btn-secondary" style={{ marginTop: 4 }} onClick={addRule}>+ Add Rule</button>
+              </div>
+            </>
+          )}
+        </div>
 
         <div className="modal-footer">
           <button className="btn-secondary" onClick={onClose} disabled={saving}>Cancel</button>
-          <button
-            className="btn-primary"
-            style={{ width: "auto", padding: "10px 24px" }}
-            onClick={handleSave}
-            disabled={loading || saving}
-          >
-            {saving ? "Saving..." : "Save Schedule"}
+          <button className="btn-primary" style={{ width: "auto", padding: "10px 24px" }}
+            onClick={handleSaveAll} disabled={saving}>
+            {saving ? "Saving..." : "Save Profile"}
           </button>
         </div>
       </div>
@@ -2703,7 +3264,7 @@ function ScheduleRulesModal({ kid, onClose, onLoad, onSave }) {
 }
 
 // ─── History Viewer Modal ─────────────────────────────────────────────────────
-function HistoryViewer({ item, onClose, onDelete }) {
+function HistoryViewer({ item, onClose, onDelete, onAssignToPlan }) {
   const handlePrint = () => {
     const win = window.open("", "_blank");
     win.document.write(`<html><head><title>${item.toolTitle} — ${item.topic}</title>
@@ -2729,6 +3290,19 @@ function HistoryViewer({ item, onClose, onDelete }) {
         </div>
         <div style={{ fontWeight: 700, fontSize: "1rem", marginBottom: 12, color: "var(--text)" }}>{item.topic}</div>
         <div className="viewer-content">{item.content}</div>
+        {onAssignToPlan && item.kidId && (
+          <AssignToPlanRow
+            kidId={item.kidId}
+            kidName={item.kidName}
+            getEntry={() => ({
+              toolTitle: item.toolTitle,
+              subject: item.subject,
+              topic: item.topic,
+              content: item.content,
+            })}
+            onAssignToPlan={onAssignToPlan}
+          />
+        )}
         <div className="viewer-footer">
           <button className="btn-secondary danger" style={{ color: "#c0392b" }}
             onClick={() => { onDelete(item.id); onClose(); }}>🗑️ Delete</button>
@@ -2741,7 +3315,15 @@ function HistoryViewer({ item, onClose, onDelete }) {
 }
 
 // ─── Dashboard ────────────────────────────────────────────────────────────────
-function Dashboard({ user, kids, semesterDates, lessonPlans, onAddKid, onSaveGeneration, onDeleteGeneration, onSaveCurriculum, onLoadScheduleRules, onSaveScheduleRules, onLoadLessonPlan, onSaveLessonPlan, onAssignLessonPlanItem, onSignOut }) {
+function Dashboard({
+  user, kids, semesterDates, lessonPlans, onAddKid,
+  onSaveGeneration, onDeleteGeneration, onSaveCurriculum,
+  onLoadScheduleRules, onSaveScheduleRules,
+  onLoadLessonPlan, onSaveLessonPlan, onAssignLessonPlanItem,
+  onAssignGenerationToPlan,
+  onUpdateKid, onAddSubject, onDeleteSubject, onUpdateSubjectResources, onUploadAvatar,
+  onSignOut
+}) {
   const [activeTool, setActiveTool] = useState(null);
   const [activeTab, setActiveTab] = useState("dashboard");
   const [history, setHistory] = useState([]);
@@ -2749,7 +3331,13 @@ function Dashboard({ user, kids, semesterDates, lessonPlans, onAddKid, onSaveGen
   const [historyFilter, setHistoryFilter] = useState("all");
   const [historyView, setHistoryView] = useState("plans");
   const [openingPlan, setOpeningPlan] = useState(null);
-  const [editingScheduleKid, setEditingScheduleKid] = useState(null);
+  const [editingProfileKidId, setEditingProfileKidId] = useState(null);
+  const [curriculumUploadFor, setCurriculumUploadFor] = useState(null);
+
+  // Re-derive the live kid object from props so profile modal sees fresh data
+  const editingProfileKid = editingProfileKidId
+    ? kids.find(k => k.id === editingProfileKidId)
+    : null;
 
   const handleSaveToHistory = async (entry) => {
     if (onSaveGeneration) {
@@ -2832,7 +3420,11 @@ function Dashboard({ user, kids, semesterDates, lessonPlans, onAddKid, onSaveGen
             <div className="kids-row">
               {kids.map(kid => (
                 <div className="kid-card" key={kid.id}>
-                  <div className="kid-avatar">{kid.emoji}</div>
+                  <div className="kid-avatar" style={{ padding: 0, overflow: "hidden" }}>
+                    {kid.avatarUrl
+                      ? <img src={kid.avatarUrl} alt={kid.name} style={{ width: "100%", height: "100%", objectFit: "cover" }} />
+                      : kid.emoji}
+                  </div>
                   <h4>{kid.name}</h4>
                   <div className="grade">{kid.grade} · {kid.learningStyle}</div>
                   <div className="subject-pills">
@@ -2875,19 +3467,23 @@ function Dashboard({ user, kids, semesterDates, lessonPlans, onAddKid, onSaveGen
             <div className="greeting"><h2>Your Students</h2></div>
             <div className="kids-row">
               {kids.map(kid => (
-                <div className="kid-card" key={kid.id} style={{ cursor: "default" }}>
-                  <div className="kid-avatar" style={{ fontSize: "1.8rem" }}>{kid.emoji}</div>
+                <div className="kid-card" key={kid.id} onClick={() => setEditingProfileKidId(kid.id)} title="Edit profile">
+                  <div className="kid-avatar" style={{ fontSize: "1.8rem", padding: 0, overflow: "hidden" }}>
+                    {kid.avatarUrl
+                      ? <img src={kid.avatarUrl} alt={kid.name} style={{ width: "100%", height: "100%", objectFit: "cover" }} />
+                      : kid.emoji}
+                  </div>
                   <h4>{kid.name}</h4>
                   <div className="grade">{kid.grade}</div>
                   <div className="subject-pills" style={{ marginBottom: 8 }}>
-                    {kid.subjects.map(s => <span className="subject-pill" key={s}>{s}</span>)}
+                    {kid.subjects.map(s => (
+                      <span className="subject-pill" key={s}>
+                        {s}
+                        {kid.curriculumWeeks?.[s] && <span style={{ marginLeft: 3 }}>✓</span>}
+                      </span>
+                    ))}
                   </div>
-                  <div style={{ marginTop: 4, fontSize: "0.78rem", fontWeight: 700, color: "var(--text-muted)", textTransform: "uppercase", letterSpacing: "0.05em" }}>
-                    Weekly Schedule
-                  </div>
-                  <button className="kid-card-edit-btn" onClick={() => setEditingScheduleKid(kid)}>
-                    ✏️ Edit Schedule
-                  </button>
+                  <div className="kid-card-hint">✏️ Edit Profile</div>
                 </div>
               ))}
               <div className="add-kid-card" onClick={onAddKid}>
@@ -3047,15 +3643,10 @@ function Dashboard({ user, kids, semesterDates, lessonPlans, onAddKid, onSaveGen
         })()}
       </div>
 
-      {activeTool?.id === "curriculum" ? (
-        <CurriculumUploadModal
-          kids={kids}
-          onClose={() => setActiveTool(null)}
-          onSave={handleCurriculumSave}
-        />
-      ) : activeTool?.id === "weeklyplan" ? (
+      {activeTool?.id === "weeklyplan" ? (
         <WeeklyPlanModal
           kids={kids}
+          semester={semesterDates}
           onClose={() => { setActiveTool(null); setOpeningPlan(null); }}
           onLoadScheduleRules={onLoadScheduleRules}
           onLoadPlan={onLoadLessonPlan}
@@ -3065,7 +3656,13 @@ function Dashboard({ user, kids, semesterDates, lessonPlans, onAddKid, onSaveGen
           initialWeekStart={openingPlan?.weekStartDate}
         />
       ) : activeTool ? (
-        <GenerationModal tool={activeTool} kids={kids} onClose={() => setActiveTool(null)} onSave={handleSaveToHistory} />
+        <GenerationModal
+          tool={activeTool}
+          kids={kids}
+          onClose={() => setActiveTool(null)}
+          onSave={handleSaveToHistory}
+          onAssignToPlan={onAssignGenerationToPlan}
+        />
       ) : null}
 
       {viewingItem && (
@@ -3073,15 +3670,34 @@ function Dashboard({ user, kids, semesterDates, lessonPlans, onAddKid, onSaveGen
           item={viewingItem}
           onClose={() => setViewingItem(null)}
           onDelete={handleDeleteFromHistory}
+          onAssignToPlan={onAssignGenerationToPlan}
         />
       )}
 
-      {editingScheduleKid && (
-        <ScheduleRulesModal
-          kid={editingScheduleKid}
-          onClose={() => setEditingScheduleKid(null)}
-          onLoad={onLoadScheduleRules}
-          onSave={onSaveScheduleRules}
+      {editingProfileKid && (
+        <StudentProfileModal
+          kid={editingProfileKid}
+          onClose={() => setEditingProfileKidId(null)}
+          onUpdateKid={onUpdateKid}
+          onAddSubject={onAddSubject}
+          onDeleteSubject={onDeleteSubject}
+          onUpdateSubjectResources={onUpdateSubjectResources}
+          onUploadAvatar={onUploadAvatar}
+          onLoadScheduleRules={onLoadScheduleRules}
+          onSaveScheduleRules={onSaveScheduleRules}
+          onLaunchCurriculumUpload={({ kidId, subject }) => setCurriculumUploadFor({ kidId, subject })}
+        />
+      )}
+
+      {curriculumUploadFor && (
+        <CurriculumUploadModal
+          kids={kids}
+          onClose={() => setCurriculumUploadFor(null)}
+          onSave={async ({ kidId, subject, weeks }) => {
+            await handleCurriculumSave({ kidId, subject, weeks });
+          }}
+          initialKidId={curriculumUploadFor.kidId}
+          initialSubject={curriculumUploadFor.subject}
         />
       )}
     </div>
@@ -3196,6 +3812,8 @@ export default function HomeRoom() {
     saveGeneration, deleteGeneration,
     loadScheduleRules, saveScheduleRules,
     loadLessonPlan, saveLessonPlan, assignLessonPlanItem,
+    assignGenerationToPlan,
+    updateKid, addSubjectToKid, deleteSubject, updateSubjectResources, uploadKidAvatar,
     completeSetup
   } = useHomeRoom(user?.id);
 
@@ -3240,6 +3858,12 @@ export default function HomeRoom() {
         onLoadLessonPlan={loadLessonPlan}
         onSaveLessonPlan={saveLessonPlan}
         onAssignLessonPlanItem={assignLessonPlanItem}
+        onAssignGenerationToPlan={assignGenerationToPlan}
+        onUpdateKid={updateKid}
+        onAddSubject={addSubjectToKid}
+        onDeleteSubject={deleteSubject}
+        onUpdateSubjectResources={updateSubjectResources}
+        onUploadAvatar={uploadKidAvatar}
         onSignOut={signOut}
         onAddKid={saveKid}
       />

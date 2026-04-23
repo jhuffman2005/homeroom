@@ -205,3 +205,47 @@ create policy "kid_schedule_rules: own via kid" on kid_schedule_rules
       and kids.user_id = auth.uid()
     )
   );
+
+-- ─────────────────────────────────────────────────────────────
+-- Profile & curriculum source-of-truth fields
+-- ─────────────────────────────────────────────────────────────
+
+alter table kids add column if not exists avatar_url text;
+alter table subjects add column if not exists book_title text;
+alter table subjects add column if not exists book_link text;
+
+-- ─── Storage bucket for kid avatars ──────────────────────────
+insert into storage.buckets (id, name, public)
+  values ('avatars', 'avatars', true)
+  on conflict (id) do nothing;
+
+-- Avatar files live at avatars/{user_id}/{kid_id}.{ext}
+-- Owner can write to their own folder; anyone can read (bucket is public).
+drop policy if exists "Avatar uploads by owner" on storage.objects;
+create policy "Avatar uploads by owner" on storage.objects
+  for insert to authenticated
+  with check (
+    bucket_id = 'avatars'
+    and (storage.foldername(name))[1] = auth.uid()::text
+  );
+
+drop policy if exists "Avatar updates by owner" on storage.objects;
+create policy "Avatar updates by owner" on storage.objects
+  for update to authenticated
+  using (
+    bucket_id = 'avatars'
+    and (storage.foldername(name))[1] = auth.uid()::text
+  );
+
+drop policy if exists "Avatar deletes by owner" on storage.objects;
+create policy "Avatar deletes by owner" on storage.objects
+  for delete to authenticated
+  using (
+    bucket_id = 'avatars'
+    and (storage.foldername(name))[1] = auth.uid()::text
+  );
+
+drop policy if exists "Public read avatars" on storage.objects;
+create policy "Public read avatars" on storage.objects
+  for select to public
+  using (bucket_id = 'avatars');
