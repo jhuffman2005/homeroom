@@ -2029,6 +2029,106 @@ const styles = `
     border-color: var(--green);
   }
 
+  /* ── Students sub-nav + page ── */
+  .student-subnav {
+    display: flex;
+    gap: 8px;
+    flex-wrap: wrap;
+    margin-bottom: 24px;
+    padding-bottom: 16px;
+    border-bottom: 1px solid var(--cream-dark);
+  }
+
+  .student-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 14px 6px 6px;
+    border-radius: 28px;
+    border: 1.5px solid var(--cream-dark);
+    background: var(--white);
+    cursor: pointer;
+    font-family: 'Lato', sans-serif;
+    font-size: 0.88rem;
+    font-weight: 700;
+    color: var(--text);
+    transition: all 0.15s;
+  }
+
+  .student-pill:hover {
+    border-color: var(--green-light);
+  }
+
+  .student-pill.active {
+    border-color: var(--green);
+    background: var(--green-pale);
+    color: var(--green);
+  }
+
+  .student-pill-avatar {
+    width: 32px;
+    height: 32px;
+    border-radius: 50%;
+    background: var(--green-pale);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    overflow: hidden;
+    flex-shrink: 0;
+    font-size: 1.1rem;
+  }
+
+  .student-pill-avatar img {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+  }
+
+  .student-pill.add {
+    padding: 6px 16px;
+    border-style: dashed;
+    color: var(--text-muted);
+  }
+
+  .student-pill.add:hover {
+    color: var(--green);
+    border-color: var(--green-light);
+  }
+
+  .student-page-header {
+    margin-bottom: 24px;
+  }
+
+  .student-page-header h2 {
+    font-family: 'Dancing Script', cursive;
+    font-size: 2.4rem;
+    color: var(--green);
+    letter-spacing: 0.02em;
+    margin-bottom: 4px;
+  }
+
+  .student-page-sub {
+    color: var(--text-muted);
+    font-size: 0.95rem;
+  }
+
+  .page-section {
+    background: var(--white);
+    border-radius: var(--radius);
+    padding: 28px;
+    box-shadow: var(--shadow);
+    margin-bottom: 20px;
+    animation: fadeUp 0.3s ease;
+  }
+
+  .page-section-footer {
+    display: flex;
+    justify-content: flex-end;
+    margin-top: 20px;
+    padding-top: 16px;
+    border-top: 1px solid var(--cream-dark);
+  }
+
   /* ── History Viewer Modal ── */
   .viewer-modal {
     background: var(--white);
@@ -2098,7 +2198,6 @@ const LEARNING_STYLES = [
 ];
 
 const TOOLS = [
-  { id: "weeklyplan", icon: "📆", title: "Weekly Plan", desc: "Auto-generate this week's Mon-Fri schedule" },
   { id: "lesson", icon: "📋", title: "Lesson Plan", desc: "Full weekly lesson plan for any subject" },
   { id: "worksheet", icon: "✏️", title: "Worksheet", desc: "Practice problems & activities" },
   { id: "quiz", icon: "🎯", title: "Quiz or Test", desc: "Assessment for any topic" },
@@ -2799,11 +2898,23 @@ Example:
 [{"day":"Monday","subject":"Math","task_title":"Adding fractions","content":"Saxon Math 7/6 — Lesson 12 (pp. 45-48). Practice adding fractions with unlike denominators and check answers in the back."}]`;
 }
 
-function WeeklyPlanModal({ kids, semester, onClose, onLoadScheduleRules, onLoadPlan, onSavePlan, onAssignItem, initialKidId, initialWeekStart }) {
+function WeeklyPlanModal({ kids, semester, onClose, onLoadScheduleRules, onLoadPlan, onSavePlan, onAssignItem, initialKidId, initialWeekStart, as = "modal" }) {
+  const inline = as === "inline";
   const [kidId, setKidId] = useState(initialKidId || kids[0]?.id || "");
   const [weekStart, setWeekStart] = useState(() =>
     initialWeekStart ? getMondayOf(new Date(initialWeekStart + "T00:00:00")) : getMondayOf(new Date())
   );
+
+  // When parent passes a new initialKidId (e.g. switching kids on student page), follow it
+  useEffect(() => {
+    if (initialKidId && initialKidId !== kidId) setKidId(initialKidId);
+  }, [initialKidId]);
+  useEffect(() => {
+    if (initialWeekStart) {
+      const d = getMondayOf(new Date(initialWeekStart + "T00:00:00"));
+      if (isoLocalDate(d) !== isoLocalDate(weekStart)) setWeekStart(d);
+    }
+  }, [initialWeekStart]);
   const [items, setItems] = useState([]);
   const [generating, setGenerating] = useState(false);
   const [loadingExisting, setLoadingExisting] = useState(false);
@@ -2889,82 +3000,95 @@ function WeeklyPlanModal({ kids, semester, onClose, onLoadScheduleRules, onLoadP
   const itemsByDay = DAY_NAMES.reduce((acc, d) => { acc[d] = []; return acc; }, {});
   items.forEach(it => { if (itemsByDay[it.day]) itemsByDay[it.day].push(it); });
 
-  return (
-    <div className="modal-overlay" onClick={e => e.target === e.currentTarget && onClose()}>
-      <div className="modal" style={{ maxWidth: 1000 }}>
-        <h2>📆 Weekly Plan</h2>
-        <p className="subtitle">Generate a Mon-Fri schedule that respects the kid's subjects and special rules.</p>
+  const inner = (
+    <>
+      {!inline && (
+        <>
+          <h2>📆 Weekly Plan</h2>
+          <p className="subtitle">Generate a Mon-Fri schedule that respects the kid's subjects and special rules.</p>
+        </>
+      )}
 
-        <div style={{ display: "flex", gap: 12, alignItems: "flex-end", marginBottom: 20, flexWrap: "wrap" }}>
+      <div style={{ display: "flex", gap: 12, alignItems: "flex-end", marginBottom: 20, flexWrap: "wrap" }}>
+        {!inline && (
           <div className="form-group" style={{ marginBottom: 0, flex: "1 1 200px", minWidth: 200 }}>
             <label>Student</label>
             <select value={kidId} onChange={e => setKidId(e.target.value)}>
               {kids.map(k => <option key={k.id} value={k.id}>{k.name} — {k.grade}</option>)}
             </select>
           </div>
+        )}
 
-          <div className="week-nav">
-            <button className="btn-secondary" onClick={() => setWeekStart(addDays(weekStart, -7))} title="Previous week">‹</button>
-            <div className="week-label">{fmtMonthDay(weekStart)} – {fmtMonthDay(weekDates[4])}</div>
-            <button className="btn-secondary" onClick={() => setWeekStart(addDays(weekStart, 7))} title="Next week">›</button>
-          </div>
-
-          <button
-            className="btn-primary"
-            style={{ width: "auto", padding: "10px 20px" }}
-            onClick={handleGenerate}
-            disabled={generating || !kidId}
-          >
-            {generating ? "Generating..." : items.length ? "Regenerate" : "Generate Plan"}
-          </button>
+        <div className="week-nav">
+          <button className="btn-secondary" onClick={() => setWeekStart(addDays(weekStart, -7))} title="Previous week">‹</button>
+          <div className="week-label">{fmtMonthDay(weekStart)} – {fmtMonthDay(weekDates[4])}</div>
+          <button className="btn-secondary" onClick={() => setWeekStart(addDays(weekStart, 7))} title="Next week">›</button>
         </div>
 
-        {error && (
-          <div style={{ background: "#fde8e8", color: "#c0392b", borderRadius: 8, padding: "10px 14px", fontSize: "0.85rem", marginBottom: 16 }}>
-            ⚠️ {error}
-          </div>
-        )}
+        <button
+          className="btn-primary"
+          style={{ width: "auto", padding: "10px 20px" }}
+          onClick={handleGenerate}
+          disabled={generating || !kidId}
+        >
+          {generating ? "Generating..." : items.length ? "Regenerate" : "Generate Plan"}
+        </button>
+      </div>
 
-        {loadingExisting ? (
-          <p style={{ color: "var(--text-muted)" }}>Loading...</p>
-        ) : (
-          <div className="week-board">
-            {DAY_NAMES.map((dayName, i) => (
-              <div className="week-col" key={dayName}>
-                <div className="week-col-header">
-                  <div className="week-col-day">{DAY_ABBR[i]}</div>
-                  <div className="week-col-date">{fmtMonthDay(weekDates[i])}</div>
-                </div>
-                <div className="week-col-cards">
-                  {itemsByDay[dayName].length === 0 && <div className="week-empty">—</div>}
-                  {itemsByDay[dayName].map((item, idx) => (
-                    <div className="plan-card" key={item.id || `${dayName}-${idx}`}>
-                      {item.subject && <div className="plan-card-subject">{item.subject}</div>}
-                      <div className="plan-card-title">{item.task_title}</div>
-                      <div className="plan-card-footer">
-                        <span className={`status-badge status-${item.status || "todo"}`}>
-                          {item.status || "todo"}
-                        </span>
-                        {item.assignment_token && item.status !== "complete" && (
-                          <button
-                            className="assign-btn"
-                            onClick={() => handleAssign(item)}
-                            title={item.status === "assigned" ? "Copy link" : "Assign and copy link"}
-                          >
-                            {copiedId === item.id
-                              ? "✓ Copied!"
-                              : item.status === "assigned" ? "Copy Link" : "Assign"}
-                          </button>
-                        )}
-                      </div>
-                    </div>
-                  ))}
-                </div>
+      {error && (
+        <div style={{ background: "#fde8e8", color: "#c0392b", borderRadius: 8, padding: "10px 14px", fontSize: "0.85rem", marginBottom: 16 }}>
+          ⚠️ {error}
+        </div>
+      )}
+
+      {loadingExisting ? (
+        <p style={{ color: "var(--text-muted)" }}>Loading...</p>
+      ) : (
+        <div className="week-board">
+          {DAY_NAMES.map((dayName, i) => (
+            <div className="week-col" key={dayName}>
+              <div className="week-col-header">
+                <div className="week-col-day">{DAY_ABBR[i]}</div>
+                <div className="week-col-date">{fmtMonthDay(weekDates[i])}</div>
               </div>
-            ))}
-          </div>
-        )}
+              <div className="week-col-cards">
+                {itemsByDay[dayName].length === 0 && <div className="week-empty">—</div>}
+                {itemsByDay[dayName].map((item, idx) => (
+                  <div className="plan-card" key={item.id || `${dayName}-${idx}`}>
+                    {item.subject && <div className="plan-card-subject">{item.subject}</div>}
+                    <div className="plan-card-title">{item.task_title}</div>
+                    <div className="plan-card-footer">
+                      <span className={`status-badge status-${item.status || "todo"}`}>
+                        {item.status || "todo"}
+                      </span>
+                      {item.assignment_token && item.status !== "complete" && (
+                        <button
+                          className="assign-btn"
+                          onClick={() => handleAssign(item)}
+                          title={item.status === "assigned" ? "Copy link" : "Assign and copy link"}
+                        >
+                          {copiedId === item.id
+                            ? "✓ Copied!"
+                            : item.status === "assigned" ? "Copy Link" : "Assign"}
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+    </>
+  );
 
+  if (inline) return <div className="page-section">{inner}</div>;
+
+  return (
+    <div className="modal-overlay" onClick={e => e.target === e.currentTarget && onClose()}>
+      <div className="modal" style={{ maxWidth: 1000 }}>
+        {inner}
         <div className="modal-footer">
           <button className="btn-secondary" onClick={onClose}>Close</button>
         </div>
@@ -2982,7 +3106,9 @@ function StudentProfileModal({
   onUpdateKid, onAddSubject, onDeleteSubject, onUpdateSubjectResources, onUploadAvatar,
   onLoadScheduleRules, onSaveScheduleRules,
   onLaunchCurriculumUpload,
+  as = "modal",
 }) {
+  const inline = as === "inline";
   const [name, setName] = useState(kid.name);
   const [grade, setGrade] = useState(kid.grade);
   const [learningStyle, setLearningStyle] = useState(kid.learningStyle || "");
@@ -3085,7 +3211,7 @@ function StudentProfileModal({
         }
       }
       await onSaveScheduleRules({ kidId: kid.id, subjectDays, specialRules });
-      onClose();
+      if (!inline) onClose?.();
     } catch (e) {
       console.error(e);
       alert("Couldn't save profile. Please try again.");
@@ -3093,11 +3219,14 @@ function StudentProfileModal({
     setSaving(false);
   };
 
-  return (
-    <div className="modal-overlay" onClick={e => e.target === e.currentTarget && onClose()}>
-      <div className="modal" style={{ maxWidth: 680 }}>
-        <h2>{kid.name}'s Profile</h2>
-        <p className="subtitle">Basic info, subjects & curriculum, and weekly schedule — all in one place.</p>
+  const inner = (
+    <>
+      {!inline && (
+        <>
+          <h2>{kid.name}'s Profile</h2>
+          <p className="subtitle">Basic info, subjects & curriculum, and weekly schedule — all in one place.</p>
+        </>
+      )}
 
         {/* PROFILE */}
         <div className="profile-section">
@@ -3251,13 +3380,22 @@ function StudentProfileModal({
           )}
         </div>
 
-        <div className="modal-footer">
-          <button className="btn-secondary" onClick={onClose} disabled={saving}>Cancel</button>
-          <button className="btn-primary" style={{ width: "auto", padding: "10px 24px" }}
-            onClick={handleSaveAll} disabled={saving}>
-            {saving ? "Saving..." : "Save Profile"}
-          </button>
-        </div>
+      <div className={inline ? "page-section-footer" : "modal-footer"}>
+        {!inline && <button className="btn-secondary" onClick={onClose} disabled={saving}>Cancel</button>}
+        <button className="btn-primary" style={{ width: "auto", padding: "10px 24px" }}
+          onClick={async () => { await handleSaveAll(); }} disabled={saving}>
+          {saving ? "Saving..." : "Save Profile"}
+        </button>
+      </div>
+    </>
+  );
+
+  if (inline) return <div className="page-section">{inner}</div>;
+
+  return (
+    <div className="modal-overlay" onClick={e => e.target === e.currentTarget && onClose()}>
+      <div className="modal" style={{ maxWidth: 680 }}>
+        {inner}
       </div>
     </div>
   );
@@ -3330,14 +3468,17 @@ function Dashboard({
   const [viewingItem, setViewingItem] = useState(null);
   const [historyFilter, setHistoryFilter] = useState("all");
   const [historyView, setHistoryView] = useState("plans");
-  const [openingPlan, setOpeningPlan] = useState(null);
-  const [editingProfileKidId, setEditingProfileKidId] = useState(null);
+  const [studentViewKidId, setStudentViewKidId] = useState(null);
+  const [studentViewWeekStart, setStudentViewWeekStart] = useState(null);
   const [curriculumUploadFor, setCurriculumUploadFor] = useState(null);
 
-  // Re-derive the live kid object from props so profile modal sees fresh data
-  const editingProfileKid = editingProfileKidId
-    ? kids.find(k => k.id === editingProfileKidId)
-    : null;
+  // Default to first kid when kids load
+  useEffect(() => {
+    if (!studentViewKidId && kids.length > 0) setStudentViewKidId(kids[0].id);
+  }, [kids, studentViewKidId]);
+
+  // Re-derive the live kid object from props
+  const studentViewKid = studentViewKidId ? kids.find(k => k.id === studentViewKidId) : null;
 
   const handleSaveToHistory = async (entry) => {
     if (onSaveGeneration) {
@@ -3464,33 +3605,65 @@ function Dashboard({
 
         {activeTab === "students" && (
           <>
-            <div className="greeting"><h2>Your Students</h2></div>
-            <div className="kids-row">
-              {kids.map(kid => (
-                <div className="kid-card" key={kid.id} onClick={() => setEditingProfileKidId(kid.id)} title="Edit profile">
-                  <div className="kid-avatar" style={{ fontSize: "1.8rem", padding: 0, overflow: "hidden" }}>
-                    {kid.avatarUrl
-                      ? <img src={kid.avatarUrl} alt={kid.name} style={{ width: "100%", height: "100%", objectFit: "cover" }} />
-                      : kid.emoji}
+            <div className="student-subnav">
+              {kids.map(k => (
+                <button
+                  key={k.id}
+                  className={`student-pill ${k.id === studentViewKidId ? "active" : ""}`}
+                  onClick={() => { setStudentViewKidId(k.id); setStudentViewWeekStart(null); }}
+                >
+                  <div className="student-pill-avatar">
+                    {k.avatarUrl
+                      ? <img src={k.avatarUrl} alt={k.name} />
+                      : <span>{k.emoji}</span>}
                   </div>
-                  <h4>{kid.name}</h4>
-                  <div className="grade">{kid.grade}</div>
-                  <div className="subject-pills" style={{ marginBottom: 8 }}>
-                    {kid.subjects.map(s => (
-                      <span className="subject-pill" key={s}>
-                        {s}
-                        {kid.curriculumWeeks?.[s] && <span style={{ marginLeft: 3 }}>✓</span>}
-                      </span>
-                    ))}
-                  </div>
-                  <div className="kid-card-hint">✏️ Edit Profile</div>
-                </div>
+                  <span>{k.name}</span>
+                </button>
               ))}
-              <div className="add-kid-card" onClick={onAddKid}>
-                <span style={{ fontSize: "1.5rem" }}>+</span>
-                Add Student
-              </div>
+              <button className="student-pill add" onClick={onAddKid}>+ Add Student</button>
             </div>
+
+            {studentViewKid ? (
+              <>
+                <div className="student-page-header">
+                  <h2>{studentViewKid.name}</h2>
+                  <div className="student-page-sub">{studentViewKid.grade}{studentViewKid.learningStyle ? ` · ${studentViewKid.learningStyle} learner` : ""}</div>
+                </div>
+
+                <WeeklyPlanModal
+                  as="inline"
+                  kids={kids}
+                  semester={semesterDates}
+                  initialKidId={studentViewKid.id}
+                  initialWeekStart={studentViewWeekStart}
+                  onLoadScheduleRules={onLoadScheduleRules}
+                  onLoadPlan={onLoadLessonPlan}
+                  onSavePlan={onSaveLessonPlan}
+                  onAssignItem={onAssignLessonPlanItem}
+                />
+
+                <StudentProfileModal
+                  as="inline"
+                  kid={studentViewKid}
+                  onUpdateKid={onUpdateKid}
+                  onAddSubject={onAddSubject}
+                  onDeleteSubject={onDeleteSubject}
+                  onUpdateSubjectResources={onUpdateSubjectResources}
+                  onUploadAvatar={onUploadAvatar}
+                  onLoadScheduleRules={onLoadScheduleRules}
+                  onSaveScheduleRules={onSaveScheduleRules}
+                  onLaunchCurriculumUpload={({ kidId, subject }) => setCurriculumUploadFor({ kidId, subject })}
+                />
+              </>
+            ) : (
+              <div className="empty-state">
+                <div className="empty-icon">👋</div>
+                <h3>No students yet</h3>
+                <p>Add a student to get started.</p>
+                <button className="btn-primary" style={{ width: "auto", marginTop: 16, padding: "10px 24px" }}
+                  onClick={onAddKid}>+ Add Student</button>
+              </div>
+            )}
           </>
         )}
 
@@ -3563,8 +3736,9 @@ function Dashboard({
                       const fmt = d => d.toLocaleDateString("en-US", { month: "short", day: "numeric" });
                       return (
                         <div className="history-card" key={p.id} onClick={() => {
-                          setOpeningPlan({ kidId: p.kidId, weekStartDate: p.weekStartDate });
-                          setActiveTool({ id: "weeklyplan", icon: "📆", title: "Weekly Plan" });
+                          setStudentViewKidId(p.kidId);
+                          setStudentViewWeekStart(p.weekStartDate);
+                          setActiveTab("students");
                         }}>
                           <div className="history-type-badge">📆</div>
                           <div className="history-meta">
@@ -3643,19 +3817,7 @@ function Dashboard({
         })()}
       </div>
 
-      {activeTool?.id === "weeklyplan" ? (
-        <WeeklyPlanModal
-          kids={kids}
-          semester={semesterDates}
-          onClose={() => { setActiveTool(null); setOpeningPlan(null); }}
-          onLoadScheduleRules={onLoadScheduleRules}
-          onLoadPlan={onLoadLessonPlan}
-          onSavePlan={onSaveLessonPlan}
-          onAssignItem={onAssignLessonPlanItem}
-          initialKidId={openingPlan?.kidId}
-          initialWeekStart={openingPlan?.weekStartDate}
-        />
-      ) : activeTool ? (
+      {activeTool ? (
         <GenerationModal
           tool={activeTool}
           kids={kids}
@@ -3671,21 +3833,6 @@ function Dashboard({
           onClose={() => setViewingItem(null)}
           onDelete={handleDeleteFromHistory}
           onAssignToPlan={onAssignGenerationToPlan}
-        />
-      )}
-
-      {editingProfileKid && (
-        <StudentProfileModal
-          kid={editingProfileKid}
-          onClose={() => setEditingProfileKidId(null)}
-          onUpdateKid={onUpdateKid}
-          onAddSubject={onAddSubject}
-          onDeleteSubject={onDeleteSubject}
-          onUpdateSubjectResources={onUpdateSubjectResources}
-          onUploadAvatar={onUploadAvatar}
-          onLoadScheduleRules={onLoadScheduleRules}
-          onSaveScheduleRules={onSaveScheduleRules}
-          onLaunchCurriculumUpload={({ kidId, subject }) => setCurriculumUploadFor({ kidId, subject })}
         />
       )}
 
