@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from "react";
+import React, { useState, useEffect, useRef } from "react";
 import { createClient } from "@supabase/supabase-js";
 
 // ─── Supabase Client ──────────────────────────────────────────────────────────
@@ -1888,6 +1888,49 @@ const styles = `
     font-weight: 700;
   }
 
+  /* ── Copyable URL field ── */
+  .copyable-url {
+    display: flex;
+    align-items: stretch;
+    gap: 0;
+    background: var(--white);
+    border: 1.5px solid var(--cream-dark);
+    border-radius: 8px;
+    overflow: hidden;
+  }
+
+  .copyable-url input {
+    flex: 1;
+    min-width: 0;
+    border: none;
+    background: transparent;
+    padding: 7px 10px;
+    font-family: 'Lato', sans-serif;
+    font-size: 16px; /* prevent iOS zoom on focus */
+    color: var(--text);
+    outline: none;
+  }
+
+  .copyable-url-btn {
+    border: none;
+    background: var(--green-pale);
+    color: var(--green);
+    padding: 0 12px;
+    cursor: pointer;
+    font-size: 0.9rem;
+    font-weight: 700;
+    border-left: 1.5px solid var(--cream-dark);
+    transition: background 0.15s;
+  }
+
+  .copyable-url-btn:hover {
+    background: var(--green);
+    color: var(--white);
+  }
+
+  .plan-card .copyable-url input { font-size: 0.72rem; padding: 5px 8px; }
+  .plan-card .copyable-url-btn { padding: 0 8px; font-size: 0.78rem; }
+
   /* ── Student Profile Modal ── */
   .profile-section {
     border-top: 1px solid var(--cream-dark);
@@ -2404,6 +2447,75 @@ function SetupFlow({ user, onComplete }) {
 }
 
 // ─── Generation Modal ─────────────────────────────────────────────────────────
+// Mobile-Safari-friendly clipboard copy.
+// Tries the modern API first; falls back to a hidden contentEditable textarea + execCommand.
+async function copyToClipboard(text) {
+  try {
+    if (navigator.clipboard && navigator.clipboard.writeText && window.isSecureContext) {
+      await navigator.clipboard.writeText(text);
+      return true;
+    }
+  } catch (_) { /* fall through to legacy path */ }
+
+  try {
+    const ta = document.createElement("textarea");
+    ta.value = text;
+    ta.contentEditable = "true";
+    ta.readOnly = false;
+    ta.style.position = "fixed";
+    ta.style.left = "0";
+    ta.style.top = "0";
+    ta.style.opacity = "0";
+    ta.style.fontSize = "16px"; // prevent iOS zoom
+    document.body.appendChild(ta);
+
+    const range = document.createRange();
+    range.selectNodeContents(ta);
+    const sel = window.getSelection();
+    sel.removeAllRanges();
+    sel.addRange(range);
+    ta.setSelectionRange(0, text.length);
+
+    const ok = document.execCommand("copy");
+    document.body.removeChild(ta);
+    return ok;
+  } catch (_) {
+    return false;
+  }
+}
+
+// Read-only URL field with a copy button. Tap-to-select for manual copy as a last resort.
+function CopyableUrl({ url }) {
+  const [justCopied, setJustCopied] = useState(false);
+  const inputRef = useRef(null);
+
+  const handleCopy = async () => {
+    const ok = await copyToClipboard(url);
+    if (ok) {
+      setJustCopied(true);
+      setTimeout(() => setJustCopied(false), 1500);
+    }
+    inputRef.current?.focus();
+    inputRef.current?.select();
+  };
+
+  return (
+    <div className="copyable-url">
+      <input
+        ref={inputRef}
+        type="text"
+        readOnly
+        value={url}
+        onFocus={e => e.target.select()}
+        onClick={e => e.target.select()}
+      />
+      <button type="button" className="copyable-url-btn" onClick={handleCopy} title="Copy link">
+        {justCopied ? "✓" : "📋"}
+      </button>
+    </div>
+  );
+}
+
 // Default to today if it's a weekday, else snap to the upcoming Monday.
 function defaultAssignDate() {
   const d = new Date();
@@ -2421,6 +2533,7 @@ function AssignToPlanRow({ kidId, kidName, getEntry, onAssignToPlan }) {
   const [date, setDate] = useState(defaultAssignDate);
   const [state, setState] = useState("idle");
   const [errMsg, setErrMsg] = useState("");
+  const [lastUrl, setLastUrl] = useState("");
 
   const handleAssign = async () => {
     if (!kidId) { setErrMsg("Pick a student first"); setState("error"); return; }
@@ -2433,9 +2546,10 @@ function AssignToPlanRow({ kidId, kidName, getEntry, onAssignToPlan }) {
     try {
       const item = await onAssignToPlan({ kidId, date, generation: getEntry() });
       const url = `https://homeroom.pro/a/${item.assignment_token}`;
-      await navigator.clipboard.writeText(url);
-      setState("copied");
-      setTimeout(() => setState(curr => curr === "copied" ? "idle" : curr), 2500);
+      setLastUrl(url);
+      const ok = await copyToClipboard(url);
+      setState(ok ? "copied" : "ready");
+      setTimeout(() => setState(curr => curr === "copied" ? "ready" : curr), 2500);
     } catch (e) {
       console.error(e);
       setErrMsg(e.message || "Couldn't assign");
@@ -2456,10 +2570,19 @@ function AssignToPlanRow({ kidId, kidName, getEntry, onAssignToPlan }) {
         >
           {state === "working" ? "Saving..."
             : state === "copied" ? "✓ Link copied!"
+            : lastUrl ? "Re-copy Link"
             : "Assign & Copy Link"}
         </button>
       </div>
       {state === "error" && <div className="assign-to-plan-error">⚠️ {errMsg}</div>}
+      {lastUrl && (
+        <div style={{ marginTop: 10 }}>
+          <div style={{ fontSize: "0.72rem", color: "var(--text-muted)", fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.05em", marginBottom: 4 }}>
+            Shareable link
+          </div>
+          <CopyableUrl url={lastUrl} />
+        </div>
+      )}
     </div>
   );
 }
@@ -2920,6 +3043,7 @@ function WeeklyPlanModal({ kids, semester, onClose, onLoadScheduleRules, onLoadP
   const [loadingExisting, setLoadingExisting] = useState(false);
   const [error, setError] = useState("");
   const [copiedId, setCopiedId] = useState(null);
+  const [shownUrls, setShownUrls] = useState({}); // itemId -> url, sticky after assign so mom can re-copy
 
   const selectedKid = kids.find(k => String(k.id) === String(kidId));
   const weekDates = [0, 1, 2, 3, 4].map(i => addDays(weekStart, i));
@@ -2988,12 +3112,15 @@ function WeeklyPlanModal({ kids, semester, onClose, onLoadScheduleRules, onLoadP
           ? { ...i, status: updated.status, assigned_at: updated.assigned_at }
           : i));
       }
-      await navigator.clipboard.writeText(url);
-      setCopiedId(item.id);
-      setTimeout(() => setCopiedId(curr => curr === item.id ? null : curr), 2000);
+      setShownUrls(prev => ({ ...prev, [item.id]: url }));
+      const ok = await copyToClipboard(url);
+      if (ok) {
+        setCopiedId(item.id);
+        setTimeout(() => setCopiedId(curr => curr === item.id ? null : curr), 2000);
+      }
     } catch (e) {
       console.error(e);
-      alert("Couldn't copy link. Please try again.");
+      alert("Couldn't assign. Please try again.");
     }
   };
 
@@ -3053,28 +3180,39 @@ function WeeklyPlanModal({ kids, semester, onClose, onLoadScheduleRules, onLoadP
               </div>
               <div className="week-col-cards">
                 {itemsByDay[dayName].length === 0 && <div className="week-empty">—</div>}
-                {itemsByDay[dayName].map((item, idx) => (
-                  <div className="plan-card" key={item.id || `${dayName}-${idx}`}>
-                    {item.subject && <div className="plan-card-subject">{item.subject}</div>}
-                    <div className="plan-card-title">{item.task_title}</div>
-                    <div className="plan-card-footer">
-                      <span className={`status-badge status-${item.status || "todo"}`}>
-                        {item.status || "todo"}
-                      </span>
-                      {item.assignment_token && item.status !== "complete" && (
-                        <button
-                          className="assign-btn"
-                          onClick={() => handleAssign(item)}
-                          title={item.status === "assigned" ? "Copy link" : "Assign and copy link"}
-                        >
-                          {copiedId === item.id
-                            ? "✓ Copied!"
-                            : item.status === "assigned" ? "Copy Link" : "Assign"}
-                        </button>
+                {itemsByDay[dayName].map((item, idx) => {
+                  const url = shownUrls[item.id]
+                    || (item.assignment_token && item.status !== "todo"
+                        ? `https://homeroom.pro/a/${item.assignment_token}`
+                        : null);
+                  return (
+                    <div className="plan-card" key={item.id || `${dayName}-${idx}`}>
+                      {item.subject && <div className="plan-card-subject">{item.subject}</div>}
+                      <div className="plan-card-title">{item.task_title}</div>
+                      <div className="plan-card-footer">
+                        <span className={`status-badge status-${item.status || "todo"}`}>
+                          {item.status || "todo"}
+                        </span>
+                        {item.assignment_token && item.status !== "complete" && (
+                          <button
+                            className="assign-btn"
+                            onClick={() => handleAssign(item)}
+                            title={item.status === "assigned" ? "Copy link" : "Assign and copy link"}
+                          >
+                            {copiedId === item.id
+                              ? "✓ Copied!"
+                              : item.status === "assigned" ? "Copy Link" : "Assign"}
+                          </button>
+                        )}
+                      </div>
+                      {url && (
+                        <div style={{ marginTop: 6 }}>
+                          <CopyableUrl url={url} />
+                        </div>
                       )}
                     </div>
-                  </div>
-                ))}
+                  );
+                })}
               </div>
             </div>
           ))}
