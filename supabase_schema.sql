@@ -321,3 +321,8 @@ create policy "semester_plan_weeks: own via plan" on semester_plan_weeks
 -- weekly_checkpoints: own rows
 create policy "weekly_checkpoints: own" on weekly_checkpoints
   for all using (auth.uid() = user_id);
+
+-- ─────────────────────────────────────────────────────────────
+-- Curriculum resource link on semester plans
+-- ─────────────────────────────────────────────────────────────
+alter table semester_plans add column if not exists curriculum_url text;

@@ -219,16 +219,23 @@ function useHomeRoom(userId) {
   };
 
   // Look up this-week / last-week semester plan entries for every subject the kid has a plan for.
-  // Returns { [subject]: { topic, description, weekNumber } } for the given week_start_date.
+  // Returns { [subject]: { topic, description, weekNumber, curriculumName, curriculumUrl } }
+  // for the given week_start_date.
   const loadSemesterPlanWeekFor = async ({ kidId, weekStartDate }) => {
     const { data: plans, error: plansErr } = await supabase
       .from("semester_plans")
-      .select("id, subject")
+      .select("id, subject, curriculum_name, curriculum_url")
       .eq("kid_id", kidId);
     if (plansErr) { console.error("loadSemesterPlanWeekFor plans:", plansErr); return {}; }
     if (!plans || !plans.length) return {};
-    const subjectByPlanId = {};
-    plans.forEach(p => { subjectByPlanId[p.id] = p.subject; });
+    const planInfoById = {};
+    plans.forEach(p => {
+      planInfoById[p.id] = {
+        subject: p.subject,
+        curriculumName: p.curriculum_name || "",
+        curriculumUrl: p.curriculum_url || "",
+      };
+    });
     const { data: weeks, error: weeksErr } = await supabase
       .from("semester_plan_weeks")
       .select("semester_plan_id, topic, description, week_number")
@@ -237,8 +244,15 @@ function useHomeRoom(userId) {
     if (weeksErr) { console.error("loadSemesterPlanWeekFor weeks:", weeksErr); return {}; }
     const result = {};
     (weeks || []).forEach(w => {
-      const subj = subjectByPlanId[w.semester_plan_id];
-      if (subj) result[subj] = { topic: w.topic, description: w.description, weekNumber: w.week_number };
+      const info = planInfoById[w.semester_plan_id];
+      if (!info) return;
+      result[info.subject] = {
+        topic: w.topic,
+        description: w.description,
+        weekNumber: w.week_number,
+        curriculumName: info.curriculumName,
+        curriculumUrl: info.curriculumUrl,
+      };
     });
     return result;
   };
@@ -283,11 +297,11 @@ function useHomeRoom(userId) {
 
   // Loads every week from every semester_plan belonging to a kid.
   // Returns groups keyed by subject:
-  //   { [subject]: { planId, curriculumName, daysPerWeek, totalWeeks, weeks: [...] } }
+  //   { [subject]: { planId, curriculumName, curriculumUrl, daysPerWeek, totalWeeks, weeks: [...] } }
   const loadSemesterPlanWeeksForKid = async ({ kidId }) => {
     const { data: plans, error: plansErr } = await supabase
       .from("semester_plans")
-      .select("id, subject, curriculum_name, days_per_week, total_weeks")
+      .select("id, subject, curriculum_name, curriculum_url, days_per_week, total_weeks")
       .eq("kid_id", kidId)
       .order("created_at");
     if (plansErr) { console.error("loadSemesterPlanWeeksForKid plans:", plansErr); return {}; }
@@ -303,6 +317,7 @@ function useHomeRoom(userId) {
       out[p.subject] = {
         planId: p.id,
         curriculumName: p.curriculum_name || "",
+        curriculumUrl: p.curriculum_url || "",
         daysPerWeek: p.days_per_week,
         totalWeeks: p.total_weeks,
         weeks: [],
@@ -337,7 +352,7 @@ function useHomeRoom(userId) {
     return data;
   };
 
-  const saveSemesterPlan = async ({ kidId, subject, curriculumName, daysPerWeek, totalWeeks, weeks }) => {
+  const saveSemesterPlan = async ({ kidId, subject, curriculumName, curriculumUrl, daysPerWeek, totalWeeks, weeks }) => {
     const { data: planRow, error: planErr } = await supabase
       .from("semester_plans")
       .insert({
@@ -345,6 +360,7 @@ function useHomeRoom(userId) {
         kid_id: kidId,
         subject,
         curriculum_name: curriculumName || null,
+        curriculum_url: (curriculumUrl && curriculumUrl.trim()) ? curriculumUrl.trim() : null,
         days_per_week: daysPerWeek || null,
         total_weeks: totalWeeks || null,
       })
@@ -2570,6 +2586,7 @@ function SetupFlow({ user, onSaveKid, onUpdateKid, onSaveSemesterPlan, onComplet
   // Step 4 — per-subject build
   const [subjectIdx, setSubjectIdx] = useState(0);
   const [curriculumName, setCurriculumName] = useState("");
+  const [curriculumUrl, setCurriculumUrl] = useState("");
   const [daysPerWeek, setDaysPerWeek] = useState(5);
   const [uploadedFile, setUploadedFile] = useState(null);
   const [generating, setGenerating] = useState(false);
@@ -2721,6 +2738,7 @@ One object per school week listed above. Use the week_start_date values exactly 
         kidId,
         subject: currentSubject,
         curriculumName,
+        curriculumUrl,
         daysPerWeek,
         totalWeeks: generatedWeeks.length,
         weeks: generatedWeeks,
@@ -2731,6 +2749,7 @@ One object per school week listed above. Use the week_start_date values exactly 
       } else {
         setSubjectIdx(nextIdx);
         setCurriculumName("");
+        setCurriculumUrl("");
         setDaysPerWeek(5);
         setUploadedFile(null);
         setGeneratedWeeks(null);
@@ -2929,6 +2948,18 @@ One object per school week listed above. Use the week_start_date values exactly 
               <div className="form-group">
                 <label>Curriculum Name</label>
                 <input placeholder="e.g. Berean Builders Biology" value={curriculumName} onChange={e => setCurriculumName(e.target.value)} />
+              </div>
+              <div className="form-group">
+                <label>Curriculum Link</label>
+                <input
+                  type="url"
+                  placeholder="e.g. https://bereanbuilders.com/product/biology"
+                  value={curriculumUrl}
+                  onChange={e => setCurriculumUrl(e.target.value)}
+                />
+                <div style={{ fontSize: "0.78rem", color: "var(--text-muted, #8A7968)", marginTop: 4 }}>
+                  Link to purchase page, publisher site, or digital resource
+                </div>
               </div>
               <div className="form-group">
                 <label>Days Per Week</label>
@@ -4368,17 +4399,26 @@ function buildSundayPrompt(tool, kid, subject, topic, description, carryover) {
 
 function SundayPlanningFlow({
   kid,
-  weekStartDate,
+  weekStartDate,                    // suggested default from Dashboard (today's Monday)
   onLoadScheduleRules,
   onLoadSemesterPlanWeekFor,
+  onLoadSemesterPlanWeeksForKid,    // for the Step 0 dropdown
+  onLoadLessonPlan,                 // to detect an existing plan for the selected week
   onLoadWeeklyCheckpoint,
   onSaveWeeklyCheckpoint,
   onSaveLessonPlan,
   onClose,
 }) {
-  const [step, setStep] = useState(1);
-  const [loading, setLoading] = useState(true);
+  // step 0 = pick week, 1 = carryover, 2 = preview, 3 = generate
+  const [step, setStep] = useState(0);
+  const [loading, setLoading] = useState(false);
   const [loadError, setLoadError] = useState("");
+
+  // Step 0
+  const [availableWeeks, setAvailableWeeks] = useState([]); // [{weekNumber, weekStartDate}]
+  const [availableWeeksLoading, setAvailableWeeksLoading] = useState(true);
+  const [selectedWeekStart, setSelectedWeekStart] = useState(weekStartDate || "");
+  const [existingPlanExists, setExistingPlanExists] = useState(false);
 
   // Step 1
   const [lastWeekTopics, setLastWeekTopics] = useState({});
@@ -4396,33 +4436,97 @@ function SundayPlanningFlow({
   const [done, setDone] = useState(false);
   const [genError, setGenError] = useState("");
 
-  const weekDate = useMemo(() => new Date(weekStartDate + "T00:00:00"), [weekStartDate]);
+  // Selected week derivations
+  const weekDate = useMemo(
+    () => selectedWeekStart ? new Date(selectedWeekStart + "T00:00:00") : null,
+    [selectedWeekStart]
+  );
+  // Find the prior week_number from availableWeeks (NOT calendar -7 days, so break weeks are skipped properly).
   const lastWeekIso = useMemo(() => {
-    const d = new Date(weekDate);
-    d.setDate(d.getDate() - 7);
-    return isoLocalDate(d);
-  }, [weekDate]);
-  const fridayDate = useMemo(() => addDays(weekDate, 4), [weekDate]);
-  const weekRangeStr = `${fmtMonthDay(weekDate)} – ${fmtMonthDay(fridayDate)}, ${weekDate.getFullYear()}`;
+    if (!selectedWeekStart || availableWeeks.length === 0) return null;
+    const sel = availableWeeks.find(w => w.weekStartDate === selectedWeekStart);
+    if (!sel) return null;
+    const prev = availableWeeks.find(w => w.weekNumber === (sel.weekNumber - 1));
+    return prev?.weekStartDate || null;
+  }, [selectedWeekStart, availableWeeks]);
+  const fridayDate = useMemo(() => weekDate ? addDays(weekDate, 4) : null, [weekDate]);
+  const weekRangeStr = weekDate ? `${fmtMonthDay(weekDate)} – ${fmtMonthDay(fridayDate)}, ${weekDate.getFullYear()}` : "";
+  const selectedWeekNumber = useMemo(
+    () => availableWeeks.find(w => w.weekStartDate === selectedWeekStart)?.weekNumber || null,
+    [availableWeeks, selectedWeekStart]
+  );
 
-  // Load up everything
+  // ── Load the dropdown options once on mount ──
   useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      setAvailableWeeksLoading(true);
+      try {
+        const groups = await onLoadSemesterPlanWeeksForKid({ kidId: kid.id });
+        if (cancelled) return;
+        // Merge non-break weeks across all subjects, dedupe by week_start_date
+        const byDate = {};
+        Object.values(groups || {}).forEach(g => {
+          (g.weeks || []).forEach(w => {
+            if (w.isBreak) return;
+            if (!w.weekStartDate) return;
+            if (!byDate[w.weekStartDate]) {
+              byDate[w.weekStartDate] = { weekNumber: w.weekNumber, weekStartDate: w.weekStartDate };
+            }
+          });
+        });
+        const list = Object.values(byDate).sort((a, b) => (a.weekNumber || 0) - (b.weekNumber || 0));
+        setAvailableWeeks(list);
+        // Pick a sensible default: the suggested week if it's in the list, else first.
+        if (list.length > 0) {
+          const match = list.find(w => w.weekStartDate === weekStartDate);
+          setSelectedWeekStart((match || list[0]).weekStartDate);
+        }
+      } catch (e) {
+        console.error("loadAvailableWeeks:", e);
+      } finally {
+        if (!cancelled) setAvailableWeeksLoading(false);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [kid.id]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // ── Existing-plan check fires whenever the selected week changes ──
+  useEffect(() => {
+    if (!selectedWeekStart) { setExistingPlanExists(false); return; }
+    let cancelled = false;
+    (async () => {
+      try {
+        const { planId } = await onLoadLessonPlan({ kidId: kid.id, weekStartDate: selectedWeekStart });
+        if (!cancelled) setExistingPlanExists(!!planId);
+      } catch (e) {
+        console.error("existingPlanCheck:", e);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [kid.id, selectedWeekStart]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // ── Heavy load (carryover targets, plan preview, schedule, checkpoint) — only after step 0 ──
+  useEffect(() => {
+    if (step < 1) return;
+    if (!selectedWeekStart) return;
     let cancelled = false;
     (async () => {
       setLoading(true);
       setLoadError("");
       try {
         const [last, current, schedule, checkpoint] = await Promise.all([
-          onLoadSemesterPlanWeekFor({ kidId: kid.id, weekStartDate: lastWeekIso }),
-          onLoadSemesterPlanWeekFor({ kidId: kid.id, weekStartDate }),
+          lastWeekIso
+            ? onLoadSemesterPlanWeekFor({ kidId: kid.id, weekStartDate: lastWeekIso })
+            : Promise.resolve({}),
+          onLoadSemesterPlanWeekFor({ kidId: kid.id, weekStartDate: selectedWeekStart }),
           onLoadScheduleRules(kid.id),
-          onLoadWeeklyCheckpoint({ kidId: kid.id, weekStartDate }),
+          onLoadWeeklyCheckpoint({ kidId: kid.id, weekStartDate: selectedWeekStart }),
         ]);
         if (cancelled) return;
         setLastWeekTopics(last || {});
         setThisWeekTopics(current || {});
         setSubjectDays(schedule?.subjectDays || {});
-        // If there's an existing checkpoint and it's already approved+generated, jump to a "already done" state
         if (checkpoint?.generated_at) {
           setDone(true);
           setStep(3);
@@ -4435,7 +4539,7 @@ function SundayPlanningFlow({
       }
     })();
     return () => { cancelled = true; };
-  }, [kid.id, weekStartDate, lastWeekIso]);
+  }, [step, kid.id, selectedWeekStart, lastWeekIso]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Subjects that are scheduled this week
   const subjectsThisWeek = useMemo(
@@ -4467,7 +4571,7 @@ function SundayPlanningFlow({
     try {
       await onSaveWeeklyCheckpoint({
         kidId: kid.id,
-        weekStartDate,
+        weekStartDate: selectedWeekStart,
         carryoverNotes: notes || null,
       });
       setStep(2);
@@ -4482,7 +4586,7 @@ function SundayPlanningFlow({
     try {
       await onSaveWeeklyCheckpoint({
         kidId: kid.id,
-        weekStartDate,
+        weekStartDate: selectedWeekStart,
         approvedAt: new Date().toISOString(),
       });
       setStep(3);
@@ -4561,10 +4665,10 @@ function SundayPlanningFlow({
     }
 
     try {
-      await onSaveLessonPlan({ kidId: kid.id, weekStartDate, items: collected });
+      await onSaveLessonPlan({ kidId: kid.id, weekStartDate: selectedWeekStart, items: collected });
       await onSaveWeeklyCheckpoint({
         kidId: kid.id,
-        weekStartDate,
+        weekStartDate: selectedWeekStart,
         generatedAt: new Date().toISOString(),
       });
       setSavedItemCount(collected.length);
@@ -4599,9 +4703,10 @@ function SundayPlanningFlow({
         <div style={headerStyle}>
           <div>
             <div style={{ fontSize: "0.78rem", color: "var(--text-muted, #8A7968)", fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.05em" }}>
-              Sunday Planning · {kid.name} · Week of {fmtMonthDay(weekDate)}
+              Sunday Planning · {kid.name}{step > 0 && weekDate ? ` · Week ${selectedWeekNumber || ""} (${fmtMonthDay(weekDate)})` : ""}
             </div>
             <h2 style={{ margin: "4px 0 0", fontSize: "1.4rem", color: "var(--green, #4A7C5F)" }}>
+              {step === 0 && "Select Your Planning Week"}
               {step === 1 && "Carryover Check"}
               {step === 2 && "This Week's Plan"}
               {step === 3 && (done ? "All Set!" : "Generate Materials")}
@@ -4618,6 +4723,49 @@ function SundayPlanningFlow({
           {loading && <div style={{ padding: 32, textAlign: "center", color: "var(--text-muted, #8A7968)" }}>Loading...</div>}
           {loadError && !loading && (
             <div style={{ background: "#fde8e8", color: "#c0392b", borderRadius: 8, padding: "10px 14px", fontSize: "0.85rem" }}>⚠️ {loadError}</div>
+          )}
+
+          {step === 0 && (
+            <>
+              {availableWeeksLoading ? (
+                <div style={{ padding: 24, textAlign: "center", color: "var(--text-muted, #8A7968)" }}>Loading available weeks...</div>
+              ) : availableWeeks.length === 0 ? (
+                <div style={{ padding: 16, background: "#fff8e1", color: "#7c6a00", borderRadius: 10, lineHeight: 1.5 }}>
+                  No semester plan weeks found for {kid.name}. Run the setup flow to build one first.
+                </div>
+              ) : (
+                <>
+                  <div style={{ marginBottom: 16, color: "var(--text-muted, #8A7968)", lineHeight: 1.5 }}>
+                    Pick the week you want to plan. You can plan ahead or catch up on a week you missed.
+                  </div>
+                  <div className="form-group" style={{ marginBottom: 14 }}>
+                    <label style={{ display: "block", fontSize: "0.82rem", fontWeight: 700, color: "var(--text-muted, #8A7968)", marginBottom: 6, textTransform: "uppercase", letterSpacing: "0.05em" }}>
+                      Planning Week
+                    </label>
+                    <select
+                      value={selectedWeekStart}
+                      onChange={e => setSelectedWeekStart(e.target.value)}
+                      style={{ width: "100%", padding: "10px 12px", borderRadius: 10, border: "1px solid var(--cream-dark, #F2E9DC)", fontSize: "0.95rem", background: "#fff" }}
+                    >
+                      {availableWeeks.map(w => {
+                        const start = new Date(w.weekStartDate + "T00:00:00");
+                        const end = addDays(start, 4);
+                        return (
+                          <option key={w.weekStartDate} value={w.weekStartDate}>
+                            Week {w.weekNumber} — {fmtMonthDay(start)} to {fmtMonthDay(end)}
+                          </option>
+                        );
+                      })}
+                    </select>
+                  </div>
+                  {existingPlanExists && (
+                    <div style={{ background: "#fff8e1", border: "1px solid #f0d97d", color: "#7c6a00", borderRadius: 10, padding: "12px 14px", marginBottom: 4, fontSize: "0.88rem", lineHeight: 1.5 }}>
+                      ⚠️ You already generated materials for this week. Continuing will add to or replace existing materials.
+                    </div>
+                  )}
+                </>
+              )}
+            </>
           )}
 
           {!loading && !loadError && step === 1 && (
@@ -4705,6 +4853,22 @@ function SundayPlanningFlow({
                           ))}
                         </div>
                       </div>
+                      {tdata.curriculumName && (
+                        <div style={{ fontSize: "0.78rem", color: "var(--text-muted, #8A7968)", marginBottom: 6 }}>
+                          {tdata.curriculumUrl ? (
+                            <a
+                              href={tdata.curriculumUrl}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              style={{ color: "var(--green, #4A7C5F)", textDecoration: "underline", display: "inline-flex", alignItems: "center", gap: 4 }}
+                            >
+                              {tdata.curriculumName} <span aria-hidden="true">↗</span>
+                            </a>
+                          ) : (
+                            tdata.curriculumName
+                          )}
+                        </div>
+                      )}
                       {carry && (
                         <div style={{ fontSize: "0.78rem", background: "#fff4e0", color: "#8a5a00", borderRadius: 8, padding: "6px 10px", marginBottom: 8 }}>
                           ↩️ Carryover: {carry}
@@ -4770,9 +4934,22 @@ function SundayPlanningFlow({
         </div>
 
         <div style={footerStyle}>
-          {!loading && !loadError && step === 1 && (
+          {step === 0 && (
             <>
               <button className="btn-secondary" onClick={onClose}>Cancel</button>
+              <button
+                className="btn-primary"
+                style={{ flex: 1 }}
+                onClick={() => setStep(1)}
+                disabled={availableWeeksLoading || !selectedWeekStart || availableWeeks.length === 0}
+              >
+                Plan This Week →
+              </button>
+            </>
+          )}
+          {!loading && !loadError && step === 1 && (
+            <>
+              <button className="btn-secondary" onClick={() => setStep(0)}>← Back</button>
               <button className="btn-primary" style={{ flex: 1 }} onClick={handleStep1Next}>Next →</button>
             </>
           )}
@@ -4924,7 +5101,20 @@ function SemesterPlanModal({ kid, onClose, onLoadSemesterPlanWeeksForKid, onUpda
               <div key={subject} style={{ marginBottom: 18 }}>
                 <div style={{ display: "flex", alignItems: "baseline", gap: 8, marginBottom: 8, flexWrap: "wrap" }}>
                   <h3 style={{ margin: 0, fontSize: "1.05rem", color: "var(--green, #4A7C5F)" }}>{subject}</h3>
-                  {g.curriculumName && <span style={{ fontSize: "0.78rem", color: "var(--text-muted, #8A7968)" }}>{g.curriculumName}</span>}
+                  {g.curriculumName && (
+                    g.curriculumUrl ? (
+                      <a
+                        href={g.curriculumUrl}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        style={{ fontSize: "0.78rem", color: "var(--green, #4A7C5F)", textDecoration: "underline", display: "inline-flex", alignItems: "center", gap: 4 }}
+                      >
+                        {g.curriculumName} <span aria-hidden="true">↗</span>
+                      </a>
+                    ) : (
+                      <span style={{ fontSize: "0.78rem", color: "var(--text-muted, #8A7968)" }}>{g.curriculumName}</span>
+                    )
+                  )}
                 </div>
                 {g.weeks.length === 0 && (
                   <div style={{ fontSize: "0.85rem", color: "var(--text-muted, #8A7968)" }}>No weeks saved.</div>
@@ -5759,6 +5949,8 @@ function Dashboard({
           weekStartDate={thisMondayIso}
           onLoadScheduleRules={onLoadScheduleRules}
           onLoadSemesterPlanWeekFor={onLoadSemesterPlanWeekFor}
+          onLoadSemesterPlanWeeksForKid={onLoadSemesterPlanWeeksForKid}
+          onLoadLessonPlan={onLoadLessonPlan}
           onLoadWeeklyCheckpoint={onLoadWeeklyCheckpoint}
           onSaveWeeklyCheckpoint={onSaveWeeklyCheckpoint}
           onSaveLessonPlan={onSaveLessonPlan}
