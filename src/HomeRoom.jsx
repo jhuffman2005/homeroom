@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from "react";
+import React, { useState, useEffect, useRef, useMemo } from "react";
 import { createClient } from "@supabase/supabase-js";
 
 // ─── Supabase Client ──────────────────────────────────────────────────────────
@@ -100,7 +100,7 @@ function useHomeRoom(userId) {
   const loadKids = async () => {
     const { data, error } = await supabase
       .from("kids")
-      .select(`id, name, grade, learning_style, emoji, avatar_url, subjects(id, name, book_title, book_link, curriculum_weeks(week_number, topic, description))`)
+      .select(`id, name, grade, learning_style, emoji, avatar_url, semester_start_date, semester_end_date, break_weeks, subjects(id, name, book_title, book_link, curriculum_weeks(week_number, topic, description))`)
       .eq("user_id", userId)
       .order("created_at");
     if (error) { console.error("loadKids:", error); return; }
@@ -108,6 +108,9 @@ function useHomeRoom(userId) {
       id: k.id, name: k.name, grade: k.grade,
       learningStyle: k.learning_style, emoji: k.emoji || "📚",
       avatarUrl: k.avatar_url || null,
+      semesterStartDate: k.semester_start_date || null,
+      semesterEndDate: k.semester_end_date || null,
+      breakWeeks: k.break_weeks || [],
       subjects: (k.subjects || []).map(s => s.name),
       subjectDetails: (k.subjects || []).map(s => ({
         id: s.id,
@@ -133,16 +136,19 @@ function useHomeRoom(userId) {
       _subjectIds: (k.subjects || []).reduce((acc, s) => { acc[s.name] = s.id; return acc; }, {})
     }));
     setKids(shaped);
-    if (shaped.length > 0) setSetupDone(true);
+    // setupDone is gated on a saved semester (loadSemester or completeSetup) — kids alone aren't enough.
   };
 
-  const updateKid = async ({ kidId, name, grade, learningStyle, emoji, avatarUrl }) => {
+  const updateKid = async ({ kidId, name, grade, learningStyle, emoji, avatarUrl, semesterStartDate, semesterEndDate, breakWeeks }) => {
     const updates = {};
     if (name !== undefined) updates.name = name;
     if (grade !== undefined) updates.grade = grade;
     if (learningStyle !== undefined) updates.learning_style = learningStyle;
     if (emoji !== undefined) updates.emoji = emoji;
     if (avatarUrl !== undefined) updates.avatar_url = avatarUrl;
+    if (semesterStartDate !== undefined) updates.semester_start_date = semesterStartDate;
+    if (semesterEndDate !== undefined) updates.semester_end_date = semesterEndDate;
+    if (breakWeeks !== undefined) updates.break_weeks = breakWeeks;
     const { error } = await supabase.from("kids").update(updates).eq("id", kidId);
     if (error) throw error;
     await loadKids();
@@ -210,6 +216,155 @@ function useHomeRoom(userId) {
       .select().single();
     if (error) throw error;
     setSemester({ start: data.start_date, end: data.end_date, id: data.id });
+  };
+
+  // Look up this-week / last-week semester plan entries for every subject the kid has a plan for.
+  // Returns { [subject]: { topic, description, weekNumber } } for the given week_start_date.
+  const loadSemesterPlanWeekFor = async ({ kidId, weekStartDate }) => {
+    const { data: plans, error: plansErr } = await supabase
+      .from("semester_plans")
+      .select("id, subject")
+      .eq("kid_id", kidId);
+    if (plansErr) { console.error("loadSemesterPlanWeekFor plans:", plansErr); return {}; }
+    if (!plans || !plans.length) return {};
+    const subjectByPlanId = {};
+    plans.forEach(p => { subjectByPlanId[p.id] = p.subject; });
+    const { data: weeks, error: weeksErr } = await supabase
+      .from("semester_plan_weeks")
+      .select("semester_plan_id, topic, description, week_number")
+      .in("semester_plan_id", plans.map(p => p.id))
+      .eq("week_start_date", weekStartDate);
+    if (weeksErr) { console.error("loadSemesterPlanWeekFor weeks:", weeksErr); return {}; }
+    const result = {};
+    (weeks || []).forEach(w => {
+      const subj = subjectByPlanId[w.semester_plan_id];
+      if (subj) result[subj] = { topic: w.topic, description: w.description, weekNumber: w.week_number };
+    });
+    return result;
+  };
+
+  const loadWeeklyCheckpoint = async ({ kidId, weekStartDate }) => {
+    const { data, error } = await supabase
+      .from("weekly_checkpoints").select("*")
+      .eq("kid_id", kidId).eq("week_start_date", weekStartDate)
+      .maybeSingle();
+    if (error) { console.error("loadWeeklyCheckpoint:", error); return null; }
+    return data || null;
+  };
+
+  const saveWeeklyCheckpoint = async ({ kidId, weekStartDate, carryoverNotes, approvedAt, generatedAt }) => {
+    const existing = await loadWeeklyCheckpoint({ kidId, weekStartDate });
+    if (existing) {
+      const updates = {};
+      if (carryoverNotes !== undefined) updates.carryover_notes = carryoverNotes;
+      if (approvedAt !== undefined) updates.approved_at = approvedAt;
+      if (generatedAt !== undefined) updates.generated_at = generatedAt;
+      if (Object.keys(updates).length === 0) return existing;
+      const { data, error } = await supabase
+        .from("weekly_checkpoints").update(updates).eq("id", existing.id)
+        .select().single();
+      if (error) throw error;
+      return data;
+    }
+    const { data, error } = await supabase
+      .from("weekly_checkpoints")
+      .insert({
+        user_id: userId,
+        kid_id: kidId,
+        week_start_date: weekStartDate,
+        carryover_notes: carryoverNotes ?? null,
+        approved_at: approvedAt || null,
+        generated_at: generatedAt || null,
+      })
+      .select().single();
+    if (error) throw error;
+    return data;
+  };
+
+  // Loads every week from every semester_plan belonging to a kid.
+  // Returns groups keyed by subject:
+  //   { [subject]: { planId, curriculumName, daysPerWeek, totalWeeks, weeks: [...] } }
+  const loadSemesterPlanWeeksForKid = async ({ kidId }) => {
+    const { data: plans, error: plansErr } = await supabase
+      .from("semester_plans")
+      .select("id, subject, curriculum_name, days_per_week, total_weeks")
+      .eq("kid_id", kidId)
+      .order("created_at");
+    if (plansErr) { console.error("loadSemesterPlanWeeksForKid plans:", plansErr); return {}; }
+    if (!plans || !plans.length) return {};
+    const { data: weeks, error: weeksErr } = await supabase
+      .from("semester_plan_weeks")
+      .select("id, semester_plan_id, week_number, week_start_date, topic, description, is_break")
+      .in("semester_plan_id", plans.map(p => p.id))
+      .order("week_number");
+    if (weeksErr) { console.error("loadSemesterPlanWeeksForKid weeks:", weeksErr); return {}; }
+    const out = {};
+    plans.forEach(p => {
+      out[p.subject] = {
+        planId: p.id,
+        curriculumName: p.curriculum_name || "",
+        daysPerWeek: p.days_per_week,
+        totalWeeks: p.total_weeks,
+        weeks: [],
+      };
+    });
+    (weeks || []).forEach(w => {
+      const subject = (plans.find(p => p.id === w.semester_plan_id) || {}).subject;
+      if (!subject) return;
+      out[subject].weeks.push({
+        id: w.id,
+        weekNumber: w.week_number,
+        weekStartDate: w.week_start_date,
+        topic: w.topic,
+        description: w.description,
+        isBreak: !!w.is_break,
+      });
+    });
+    Object.values(out).forEach(g => g.weeks.sort((a, b) => (a.weekNumber || 0) - (b.weekNumber || 0)));
+    return out;
+  };
+
+  const updateSemesterPlanWeek = async ({ id, topic, description }) => {
+    const updates = {};
+    if (topic !== undefined) updates.topic = topic;
+    if (description !== undefined) updates.description = description;
+    if (Object.keys(updates).length === 0) return null;
+    const { data, error } = await supabase
+      .from("semester_plan_weeks")
+      .update(updates).eq("id", id)
+      .select().single();
+    if (error) throw error;
+    return data;
+  };
+
+  const saveSemesterPlan = async ({ kidId, subject, curriculumName, daysPerWeek, totalWeeks, weeks }) => {
+    const { data: planRow, error: planErr } = await supabase
+      .from("semester_plans")
+      .insert({
+        user_id: userId,
+        kid_id: kidId,
+        subject,
+        curriculum_name: curriculumName || null,
+        days_per_week: daysPerWeek || null,
+        total_weeks: totalWeeks || null,
+      })
+      .select()
+      .single();
+    if (planErr) throw planErr;
+
+    const weekRows = (weeks || []).map(w => ({
+      semester_plan_id: planRow.id,
+      week_number: w.week_number,
+      week_start_date: w.week_start_date || null,
+      topic: w.topic || null,
+      description: w.description || null,
+      is_break: !!w.is_break,
+    }));
+    if (weekRows.length) {
+      const { error: weeksErr } = await supabase.from("semester_plan_weeks").insert(weekRows);
+      if (weeksErr) throw weeksErr;
+    }
+    return planRow.id;
   };
 
   const saveCurriculumWeeks = async ({ kidId, subject, weeks }) => {
@@ -388,15 +543,20 @@ function useHomeRoom(userId) {
     }
   };
 
-  const completeSetup = async ({ kids: newKids, semesterDates }) => {
-    for (const kid of newKids) await saveKid(kid);
-    await saveSemester(semesterDates);
+  // Final setup gate: writes a semesters row (which loadSemester reads on next login
+  // to mark setupDone=true) and flips the flag for the current session.
+  const completeSetup = async ({ semesterDates }) => {
+    if (semesterDates?.start && semesterDates?.end) {
+      await saveSemester(semesterDates);
+    }
     setSetupDone(true);
   };
 
   return {
     kids, semester, history, lessonPlans, dataLoading, setupDone,
-    saveKid, saveSemester, saveCurriculumWeeks,
+    saveKid, saveSemester, saveCurriculumWeeks, saveSemesterPlan,
+    loadSemesterPlanWeekFor, loadSemesterPlanWeeksForKid, updateSemesterPlanWeek,
+    loadWeeklyCheckpoint, saveWeeklyCheckpoint,
     saveGeneration, deleteGeneration,
     loadScheduleRules, saveScheduleRules,
     loadLessonPlan, saveLessonPlan, assignLessonPlanItem,
@@ -2327,29 +2487,280 @@ function AuthScreen({ onLogin, onSignup }) {
 }
 
 // ─── Setup Flow ───────────────────────────────────────────────────────────────
-function SetupFlow({ user, onComplete }) {
+// Helpers for the semester week picker / planner
+function toIsoDate(d) {
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const dd = String(d.getDate()).padStart(2, "0");
+  return `${y}-${m}-${dd}`;
+}
+
+function parseIso(s) {
+  // Treat YYYY-MM-DD as a local date (avoid UTC-shift surprises)
+  return new Date(s + "T00:00:00");
+}
+
+function fmtMonDay(d) {
+  return d.toLocaleDateString("en-US", { month: "short", day: "numeric" });
+}
+
+// Returns Mon-Fri ranges, one per week, from the Monday of startDate's week
+// through the Friday on/before endDate.
+function getWeeksBetween(startDate, endDate) {
+  if (!startDate || !endDate) return [];
+  const start = parseIso(startDate);
+  const end = parseIso(endDate);
+  if (isNaN(start) || isNaN(end) || end < start) return [];
+  // Snap start back to its Monday
+  const dow = start.getDay(); // 0=Sun,1=Mon,...6=Sat
+  const daysToMonday = dow === 0 ? -6 : 1 - dow;
+  start.setDate(start.getDate() + daysToMonday);
+  const result = [];
+  const cursor = new Date(start);
+  let n = 0;
+  while (cursor <= end && n < 60) {  // safety cap
+    const weekStart = new Date(cursor);
+    const weekEnd = new Date(cursor);
+    weekEnd.setDate(weekEnd.getDate() + 4); // Friday
+    result.push({ weekStart, weekEnd });
+    cursor.setDate(cursor.getDate() + 7);
+    n++;
+  }
+  return result;
+}
+
+function fileToBase64(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const result = String(reader.result || "");
+      const idx = result.indexOf(",");
+      resolve(idx >= 0 ? result.slice(idx + 1) : result);
+    };
+    reader.onerror = () => reject(reader.error || new Error("File read failed"));
+    reader.readAsDataURL(file);
+  });
+}
+
+function extractJsonArray(text) {
+  if (!text) return null;
+  const fence = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  const body = fence ? fence[1] : text;
+  const start = body.indexOf("[");
+  const end = body.lastIndexOf("]");
+  if (start === -1 || end === -1 || end < start) return null;
+  try { return JSON.parse(body.slice(start, end + 1)); } catch { return null; }
+}
+
+function SetupFlow({ user, onSaveKid, onUpdateKid, onSaveSemesterPlan, onComplete }) {
   const [step, setStep] = useState(1);
-  const [kids, setKids] = useState([]);
-  const [currentKid, setCurrentKid] = useState({ name: "", grade: "", learningStyle: "", subjects: ["", ""] });
-  const [semesterDates, setSemesterDates] = useState({ start: "", end: "" });
 
-  const addSubject = () => setCurrentKid(k => ({ ...k, subjects: [...k.subjects, ""] }));
-  const updateSubject = (i, val) => setCurrentKid(k => ({ ...k, subjects: k.subjects.map((s, idx) => idx === i ? val : s) }));
-  const removeSubject = (i) => setCurrentKid(k => ({ ...k, subjects: k.subjects.filter((_, idx) => idx !== i) }));
+  // Step 2 — kid form
+  const [kid, setKid] = useState({ name: "", grade: "", learningStyle: "", subjects: ["", ""] });
+  const [kidId, setKidId] = useState(null);
+  const [savedSubjects, setSavedSubjects] = useState([]); // filtered list of subject names that were persisted
+  const [savingKid, setSavingKid] = useState(false);
 
-  const saveKid = () => {
-    const filtered = { ...currentKid, subjects: currentKid.subjects.filter(s => s.trim()) };
-    setKids(prev => [...prev, { ...filtered, id: Date.now(), emoji: "📚" }]);
-    setCurrentKid({ name: "", grade: "", learningStyle: "", subjects: ["", ""] });
-    setStep(3);
+  // Step 3 — semester dates + breaks
+  const [semesterStart, setSemesterStart] = useState("");
+  const [semesterEnd, setSemesterEnd] = useState("");
+  const [breakWeekStarts, setBreakWeekStarts] = useState([]); // ISO yyyy-mm-dd of week-start dates marked as break
+  const [savingDates, setSavingDates] = useState(false);
+
+  // Step 4 — per-subject build
+  const [subjectIdx, setSubjectIdx] = useState(0);
+  const [curriculumName, setCurriculumName] = useState("");
+  const [daysPerWeek, setDaysPerWeek] = useState(5);
+  const [uploadedFile, setUploadedFile] = useState(null);
+  const [generating, setGenerating] = useState(false);
+  const [generatedWeeks, setGeneratedWeeks] = useState(null);
+  const [genError, setGenError] = useState("");
+  const [savingPlan, setSavingPlan] = useState(false);
+
+  // Step-2 subject editing
+  const addSubject = () => setKid(k => ({ ...k, subjects: [...k.subjects, ""] }));
+  const updateSubjectInput = (i, val) => setKid(k => ({ ...k, subjects: k.subjects.map((s, idx) => idx === i ? val : s) }));
+  const removeSubject = (i) => setKid(k => ({ ...k, subjects: k.subjects.filter((_, idx) => idx !== i) }));
+
+  const allWeeks = useMemo(() => getWeeksBetween(semesterStart, semesterEnd), [semesterStart, semesterEnd]);
+  const schoolWeeks = useMemo(
+    () => allWeeks.filter(w => !breakWeekStarts.includes(toIsoDate(w.weekStart))),
+    [allWeeks, breakWeekStarts]
+  );
+
+  const currentSubject = savedSubjects[subjectIdx] || "";
+
+  // ── Step 2: save the kid ──
+  const handleSaveStudent = async () => {
+    const filtered = kid.subjects.map(s => s.trim()).filter(Boolean);
+    if (!kid.name || !kid.grade || filtered.length === 0) return;
+    setSavingKid(true);
+    try {
+      const id = await onSaveKid({
+        name: kid.name,
+        grade: kid.grade,
+        learningStyle: kid.learningStyle,
+        subjects: filtered,
+      });
+      setKidId(id);
+      setSavedSubjects(filtered);
+      setStep(3);
+    } catch (e) {
+      console.error(e);
+      alert("Couldn't save student: " + (e.message || "unknown error"));
+    } finally {
+      setSavingKid(false);
+    }
   };
 
+  // ── Step 3: save semester dates + breaks ──
+  const toggleBreakWeek = (iso) => {
+    setBreakWeekStarts(prev => prev.includes(iso) ? prev.filter(x => x !== iso) : [...prev, iso]);
+  };
+
+  const handleSaveDates = async () => {
+    if (!semesterStart || !semesterEnd || allWeeks.length === 0) return;
+    setSavingDates(true);
+    try {
+      await onUpdateKid({
+        kidId,
+        semesterStartDate: semesterStart,
+        semesterEndDate: semesterEnd,
+        breakWeeks: breakWeekStarts,
+      });
+      setStep(4);
+    } catch (e) {
+      console.error(e);
+      alert("Couldn't save semester dates: " + (e.message || "unknown error"));
+    } finally {
+      setSavingDates(false);
+    }
+  };
+
+  // ── Step 4: generate + save per-subject plan ──
+  const handleGenerate = async () => {
+    if (!curriculumName.trim() || schoolWeeks.length === 0) return;
+    setGenerating(true);
+    setGenError("");
+    setGeneratedWeeks(null);
+    try {
+      const weeksList = schoolWeeks
+        .map((w, i) => `Week ${i + 1}: ${toIsoDate(w.weekStart)} (${fmtMonDay(w.weekStart)} - ${fmtMonDay(w.weekEnd)})`)
+        .join("\n");
+      const firstIso = toIsoDate(schoolWeeks[0].weekStart);
+
+      const promptText =
+`You are a homeschool curriculum planner. Generate a week-by-week semester plan.
+
+Student: ${kid.name} (Grade: ${kid.grade}${kid.learningStyle ? `, ${kid.learningStyle} learner` : ""})
+Subject: ${currentSubject}
+Curriculum: ${curriculumName}
+Days per week: ${daysPerWeek}
+
+The plan must cover these school weeks (in order, one entry per week — do NOT include break weeks):
+${weeksList}
+
+${uploadedFile && uploadedFile.type === "application/pdf"
+  ? "A reference document (TOC / scope & sequence) is attached as a PDF — use it to determine the right topic for each week."
+  : (uploadedFile ? `A reference file was named "${uploadedFile.name}" but its contents could not be read; rely on the curriculum name above.` : "")}
+
+Return ONLY a JSON array, no markdown, no preamble. Format:
+[{"week_number": 1, "week_start_date": "${firstIso}", "topic": "Short title", "description": "2-3 sentences of what to cover this week"}]
+
+One object per school week listed above. Use the week_start_date values exactly as given.`;
+
+      let content;
+      if (uploadedFile && uploadedFile.type === "application/pdf") {
+        const b64 = await fileToBase64(uploadedFile);
+        content = [
+          { type: "document", source: { type: "base64", media_type: "application/pdf", data: b64 } },
+          { type: "text", text: promptText },
+        ];
+      } else {
+        content = promptText;
+      }
+
+      const res = await fetch("/api/generate", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          max_tokens: 4096,
+          messages: [{ role: "user", content }],
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data?.error || "API error");
+      const text = (data.content || []).map(b => b.text || "").join("");
+      const parsed = extractJsonArray(text);
+      if (!Array.isArray(parsed) || parsed.length === 0) {
+        throw new Error("Couldn't parse the plan. Try again.");
+      }
+      setGeneratedWeeks(parsed.map((w, i) => ({
+        week_number: w.week_number ?? i + 1,
+        week_start_date: w.week_start_date || (schoolWeeks[i] ? toIsoDate(schoolWeeks[i].weekStart) : null),
+        topic: w.topic || "",
+        description: w.description || "",
+      })));
+    } catch (e) {
+      console.error(e);
+      setGenError(e.message || "Generation failed.");
+    } finally {
+      setGenerating(false);
+    }
+  };
+
+  const updateGeneratedWeek = (i, field, value) => {
+    setGeneratedWeeks(prev => prev.map((w, idx) => idx === i ? { ...w, [field]: value } : w));
+  };
+
+  const handleLockIn = async () => {
+    if (!generatedWeeks?.length) return;
+    setSavingPlan(true);
+    try {
+      await onSaveSemesterPlan({
+        kidId,
+        subject: currentSubject,
+        curriculumName,
+        daysPerWeek,
+        totalWeeks: generatedWeeks.length,
+        weeks: generatedWeeks,
+      });
+      const nextIdx = subjectIdx + 1;
+      if (nextIdx >= savedSubjects.length) {
+        setStep(5);
+      } else {
+        setSubjectIdx(nextIdx);
+        setCurriculumName("");
+        setDaysPerWeek(5);
+        setUploadedFile(null);
+        setGeneratedWeeks(null);
+        setGenError("");
+      }
+    } catch (e) {
+      console.error(e);
+      alert("Couldn't save plan: " + (e.message || "unknown error"));
+    } finally {
+      setSavingPlan(false);
+    }
+  };
+
+  // ── Step 5: finalize ──
+  const handleEnter = async () => {
+    try {
+      await onComplete({ semesterDates: { start: semesterStart, end: semesterEnd } });
+    } catch (e) {
+      console.error(e);
+      alert("Couldn't finalize: " + (e.message || "unknown error"));
+    }
+  };
+
+  // ── Render ──
   if (step === 1) return (
     <div className="setup-wrap">
       <div className="setup-card">
-        <div className="setup-step">Step 1 of 3 — Welcome</div>
+        <div className="setup-step">Step 1 of 5 — Welcome</div>
         <h2>Welcome to HomeRoom, {user.name}! 👋</h2>
-        <p className="subtitle">Let's get your classroom set up. We'll add your kids, their subjects, and your semester dates — then HomeRoom will always know exactly where each child should be.</p>
+        <p className="subtitle">Let's get your classroom set up. We'll add your student, plan their semester (including break weeks), and use AI to map out every subject — week by week.</p>
         <button className="btn-primary" onClick={() => setStep(2)}>Let's Set Up My Classroom →</button>
       </div>
     </div>
@@ -2358,18 +2769,18 @@ function SetupFlow({ user, onComplete }) {
   if (step === 2) return (
     <div className="setup-wrap">
       <div className="setup-card">
-        <div className="setup-step">Step 2 of 3 — Add a Student</div>
+        <div className="setup-step">Step 2 of 5 — Add a Student</div>
         <h2>Tell me about your student</h2>
         <p className="subtitle">You can add more kids after setup.</p>
 
         <div className="form-group">
           <label>Child's Name</label>
-          <input placeholder="Emma" value={currentKid.name} onChange={e => setCurrentKid(k => ({ ...k, name: e.target.value }))} />
+          <input placeholder="Emma" value={kid.name} onChange={e => setKid(k => ({ ...k, name: e.target.value }))} />
         </div>
 
         <div className="form-group">
           <label>Grade Level</label>
-          <select value={currentKid.grade} onChange={e => setCurrentKid(k => ({ ...k, grade: e.target.value }))}>
+          <select value={kid.grade} onChange={e => setKid(k => ({ ...k, grade: e.target.value }))}>
             <option value="">Select grade...</option>
             {GRADE_OPTIONS.map(g => <option key={g} value={g}>{g}</option>)}
           </select>
@@ -2379,8 +2790,8 @@ function SetupFlow({ user, onComplete }) {
           <label>Learning Style</label>
           <div className="learning-styles">
             {LEARNING_STYLES.map(s => (
-              <div key={s.id} className={`style-option ${currentKid.learningStyle === s.id ? "selected" : ""}`}
-                onClick={() => setCurrentKid(k => ({ ...k, learningStyle: s.id }))}>
+              <div key={s.id} className={`style-option ${kid.learningStyle === s.id ? "selected" : ""}`}
+                onClick={() => setKid(k => ({ ...k, learningStyle: s.id }))}>
                 <div className="style-emoji">{s.emoji}</div>
                 <div className="style-name">{s.name}</div>
                 <div className="style-desc">{s.desc}</div>
@@ -2392,10 +2803,10 @@ function SetupFlow({ user, onComplete }) {
         <div className="form-group">
           <label>Subjects This Semester</label>
           <div className="subjects-list">
-            {currentKid.subjects.map((s, i) => (
+            {kid.subjects.map((s, i) => (
               <div className="subject-row" key={i}>
-                <input placeholder={`e.g. Saxon Math 7/6`} value={s} onChange={e => updateSubject(i, e.target.value)} />
-                {currentKid.subjects.length > 1 && (
+                <input placeholder={`e.g. Saxon Math 7/6`} value={s} onChange={e => updateSubjectInput(i, e.target.value)} />
+                {kid.subjects.length > 1 && (
                   <button className="remove-btn" onClick={() => removeSubject(i)}>×</button>
                 )}
               </div>
@@ -2404,46 +2815,224 @@ function SetupFlow({ user, onComplete }) {
           <button className="add-subject-btn" onClick={addSubject}>+ Add Subject</button>
         </div>
 
-        <button className="btn-primary" onClick={saveKid} disabled={!currentKid.name || !currentKid.grade}>
-          Save Student →
+        <button
+          className="btn-primary"
+          onClick={handleSaveStudent}
+          disabled={savingKid || !kid.name || !kid.grade || kid.subjects.every(s => !s.trim())}
+        >
+          {savingKid ? "Saving..." : "Save Student →"}
         </button>
       </div>
     </div>
   );
 
-  if (step === 3) return (
-    <div className="setup-wrap">
-      <div className="setup-card">
-        <div className="setup-step">Step 3 of 3 — Semester Dates</div>
-        <h2>When does your semester run?</h2>
-        <p className="subtitle">HomeRoom uses these dates to know what week your students are on — so it can surface the right topics automatically.</p>
+  if (step === 3) {
+    const breakCount = breakWeekStarts.length;
+    return (
+      <div className="setup-wrap">
+        <div className="setup-card">
+          <div className="setup-step">Step 3 of 5 — Semester Dates &amp; Break Weeks</div>
+          <h2>When does {kid.name || "your student"}'s semester run?</h2>
+          <p className="subtitle">Pick the start and end dates, then mark any weeks off.</p>
 
-        <div className="date-row" style={{ marginBottom: 24 }}>
-          <div className="form-group">
-            <label>Semester Start</label>
-            <input type="date" value={semesterDates.start} onChange={e => setSemesterDates(d => ({ ...d, start: e.target.value }))} />
+          <div className="date-row" style={{ marginBottom: 18 }}>
+            <div className="form-group">
+              <label>Semester Start</label>
+              <input type="date" value={semesterStart} onChange={e => setSemesterStart(e.target.value)} />
+            </div>
+            <div className="form-group">
+              <label>Semester End</label>
+              <input type="date" value={semesterEnd} onChange={e => setSemesterEnd(e.target.value)} />
+            </div>
           </div>
-          <div className="form-group">
-            <label>Semester End</label>
-            <input type="date" value={semesterDates.end} onChange={e => setSemesterDates(d => ({ ...d, end: e.target.value }))} />
+
+          {allWeeks.length > 0 && (
+            <div className="form-group">
+              <label>Weeks ({allWeeks.length} total{breakCount ? `, ${breakCount} break` : ""})</label>
+              <div style={{ display: "flex", flexDirection: "column", gap: 8, maxHeight: 360, overflowY: "auto", border: "1px solid var(--border, #e6e0d4)", borderRadius: 10, padding: 10 }}>
+                {allWeeks.map((w, i) => {
+                  const iso = toIsoDate(w.weekStart);
+                  const isBreak = breakWeekStarts.includes(iso);
+                  return (
+                    <div key={iso} style={{
+                      display: "flex", alignItems: "center", justifyContent: "space-between",
+                      padding: "10px 12px", borderRadius: 8,
+                      background: isBreak ? "#ececec" : "var(--green-pale, #e8f5e9)",
+                      color: isBreak ? "#888" : "var(--green, #2e7d32)",
+                      transition: "background 120ms ease",
+                    }}>
+                      <div>
+                        <div style={{ fontWeight: 700, fontSize: "0.92rem" }}>
+                          Week {i + 1}: {fmtMonDay(w.weekStart)} – {fmtMonDay(w.weekEnd)}
+                        </div>
+                        {isBreak && <div style={{ fontSize: "0.78rem", marginTop: 2 }}>No School</div>}
+                      </div>
+                      <div style={{ display: "flex", gap: 4, background: "rgba(255,255,255,0.6)", borderRadius: 999, padding: 3 }}>
+                        <button
+                          type="button"
+                          onClick={() => isBreak && toggleBreakWeek(iso)}
+                          style={{
+                            border: 0, borderRadius: 999, padding: "5px 12px", cursor: "pointer", fontSize: "0.78rem", fontWeight: 700,
+                            background: !isBreak ? "var(--green, #2e7d32)" : "transparent",
+                            color: !isBreak ? "#fff" : "#666",
+                          }}>School</button>
+                        <button
+                          type="button"
+                          onClick={() => !isBreak && toggleBreakWeek(iso)}
+                          style={{
+                            border: 0, borderRadius: 999, padding: "5px 12px", cursor: "pointer", fontSize: "0.78rem", fontWeight: 700,
+                            background: isBreak ? "#666" : "transparent",
+                            color: isBreak ? "#fff" : "#666",
+                          }}>Break</button>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+
+          <div style={{ display: "flex", gap: 12, marginTop: 12 }}>
+            <button className="btn-secondary" onClick={() => setStep(2)}>← Back</button>
+            <button
+              className="btn-primary"
+              style={{ flex: 1 }}
+              onClick={handleSaveDates}
+              disabled={savingDates || !semesterStart || !semesterEnd || allWeeks.length === 0}
+            >
+              {savingDates ? "Saving..." : "Next: Build My Semester →"}
+            </button>
           </div>
-        </div>
-
-        <div style={{ background: "var(--green-pale)", borderRadius: 10, padding: "14px 16px", marginBottom: 24, fontSize: "0.88rem", color: "var(--green)", lineHeight: 1.5 }}>
-          💡 <strong>Pro tip:</strong> You can also upload a curriculum scope & sequence document for each subject — HomeRoom will read it and know exactly what topic to cover each week.
-        </div>
-
-        <div style={{ display: "flex", gap: 12 }}>
-          <button className="btn-secondary" onClick={() => setStep(2)}>Add Another Student</button>
-          <button className="btn-primary" style={{ flex: 1 }}
-            onClick={() => onComplete({ kids, semesterDates })}
-            disabled={!semesterDates.start || !semesterDates.end}>
-            Enter HomeRoom →
-          </button>
         </div>
       </div>
-    </div>
-  );
+    );
+  }
+
+  if (step === 4) {
+    const total = savedSubjects.length;
+    return (
+      <div className="setup-wrap">
+        <div className="setup-card">
+          <div className="setup-step">Step 4 of 5 — Build My Semester ({subjectIdx + 1} of {total})</div>
+          <h2>{currentSubject}</h2>
+          <p className="subtitle">{schoolWeeks.length} school weeks to plan{savedSubjects.length > 1 ? `. We'll do one subject at a time.` : "."}</p>
+
+          {generating ? (
+            <div style={{ padding: "32px 16px", textAlign: "center", color: "var(--green, #2e7d32)" }}>
+              <div style={{ fontSize: "1.05rem", fontWeight: 700, marginBottom: 6 }}>
+                HomeRoom is building {kid.name || "your student"}'s semester...
+              </div>
+              <div style={{ fontSize: "0.86rem", color: "var(--text-muted, #888)" }}>This usually takes 10–30 seconds.</div>
+            </div>
+          ) : !generatedWeeks ? (
+            <>
+              <div className="form-group">
+                <label>Curriculum Name</label>
+                <input placeholder="e.g. Berean Builders Biology" value={curriculumName} onChange={e => setCurriculumName(e.target.value)} />
+              </div>
+              <div className="form-group">
+                <label>Days Per Week</label>
+                <select value={daysPerWeek} onChange={e => setDaysPerWeek(parseInt(e.target.value, 10))}>
+                  {[1, 2, 3, 4, 5].map(n => <option key={n} value={n}>{n} {n === 1 ? "day" : "days"} / week</option>)}
+                </select>
+              </div>
+              <div className="form-group">
+                <label>Upload TOC / Scope &amp; Sequence (optional)</label>
+                <input
+                  type="file"
+                  accept="application/pdf,.pdf,.docx,application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                  onChange={e => setUploadedFile(e.target.files?.[0] || null)}
+                />
+                {uploadedFile && (
+                  <div style={{ fontSize: "0.78rem", color: "var(--text-muted, #888)", marginTop: 6 }}>
+                    📎 {uploadedFile.name}{uploadedFile.type !== "application/pdf" && " — DOCX content can't be read directly; the curriculum name will guide the plan."}
+                  </div>
+                )}
+              </div>
+              {genError && (
+                <div style={{ background: "#fde8e8", color: "#c0392b", borderRadius: 8, padding: "10px 14px", fontSize: "0.85rem", marginBottom: 16 }}>
+                  ⚠️ {genError}
+                </div>
+              )}
+              <button
+                className="btn-primary"
+                onClick={handleGenerate}
+                disabled={!curriculumName.trim() || schoolWeeks.length === 0}
+              >
+                Generate Semester Plan
+              </button>
+            </>
+          ) : (
+            <>
+              <div style={{ display: "flex", flexDirection: "column", gap: 10, maxHeight: 460, overflowY: "auto", marginBottom: 16, border: "1px solid var(--border, #e6e0d4)", borderRadius: 10, padding: 10 }}>
+                {generatedWeeks.map((w, i) => (
+                  <div key={i} style={{ background: "#fff", border: "1px solid var(--border, #e6e0d4)", borderRadius: 10, padding: 12 }}>
+                    <div style={{ fontSize: "0.78rem", color: "var(--text-muted, #888)", fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.05em", marginBottom: 6 }}>
+                      Week {w.week_number} · {w.week_start_date}
+                    </div>
+                    <input
+                      value={w.topic}
+                      onChange={e => updateGeneratedWeek(i, "topic", e.target.value)}
+                      placeholder="Topic"
+                      style={{ width: "100%", fontSize: "1rem", fontWeight: 700, padding: "6px 8px", border: "1px solid transparent", borderRadius: 6, marginBottom: 6 }}
+                      onFocus={e => e.target.style.border = "1px solid var(--green, #2e7d32)"}
+                      onBlur={e => e.target.style.border = "1px solid transparent"}
+                    />
+                    <textarea
+                      value={w.description}
+                      onChange={e => updateGeneratedWeek(i, "description", e.target.value)}
+                      placeholder="Description"
+                      rows={3}
+                      style={{ width: "100%", fontSize: "0.88rem", padding: "6px 8px", border: "1px solid transparent", borderRadius: 6, resize: "vertical", fontFamily: "inherit", lineHeight: 1.4 }}
+                      onFocus={e => e.target.style.border = "1px solid var(--green, #2e7d32)"}
+                      onBlur={e => e.target.style.border = "1px solid transparent"}
+                    />
+                  </div>
+                ))}
+              </div>
+              <div style={{ display: "flex", gap: 12 }}>
+                <button className="btn-secondary" onClick={() => { setGeneratedWeeks(null); setGenError(""); }}>
+                  Re-generate
+                </button>
+                <button
+                  className="btn-primary"
+                  style={{ flex: 1 }}
+                  onClick={handleLockIn}
+                  disabled={savingPlan}
+                >
+                  {savingPlan ? "Saving..."
+                    : (subjectIdx + 1 < total ? "Looks Good — Next Subject →" : "Looks Good — Lock It In →")}
+                </button>
+              </div>
+            </>
+          )}
+        </div>
+      </div>
+    );
+  }
+
+  if (step === 5) {
+    const totalSchoolWeeks = schoolWeeks.length;
+    return (
+      <div className="setup-wrap">
+        <div className="setup-card">
+          <div className="setup-step">Step 5 of 5 — All Set!</div>
+          <h2>{kid.name || "Your student"}'s semester is ready! 🎉</h2>
+          <p className="subtitle">HomeRoom knows exactly what {kid.name || "they're"} learning every week.</p>
+
+          <div style={{ background: "var(--green-pale, #e8f5e9)", borderRadius: 10, padding: "14px 18px", marginBottom: 24, color: "var(--green, #2e7d32)", lineHeight: 1.7 }}>
+            <div><strong>{totalSchoolWeeks}</strong> school weeks</div>
+            <div><strong>{breakWeekStarts.length}</strong> break weeks</div>
+            <div><strong>{savedSubjects.length}</strong> subject{savedSubjects.length === 1 ? "" : "s"} planned: {savedSubjects.join(", ")}</div>
+          </div>
+
+          <button className="btn-primary" onClick={handleEnter}>Enter HomeRoom →</button>
+        </div>
+      </div>
+    );
+  }
+
+  return null;
 }
 
 // ─── Generation Modal ─────────────────────────────────────────────────────────
@@ -2529,7 +3118,124 @@ function defaultAssignDate() {
 }
 
 // Reusable Assign-to-Plan UI used by GenerationModal and HistoryViewer.
-function AssignToPlanRow({ kidId, kidName, getEntry, onAssignToPlan }) {
+// Reusable editor for lesson_plan_items.resource_links.
+// Saves directly to Supabase; the parent only needs to provide the item id (and any
+// existing links). When `itemId` is null, the editor stays in pending mode and
+// shows a hint that the content has to be assigned to a student first.
+function ResourceLinksEditor({ itemId, initialLinks, onSaved }) {
+  const normalize = (arr) => Array.isArray(arr)
+    ? arr.map(l => ({ label: l?.label || "", url: l?.url || "" }))
+    : [];
+  const [links, setLinks] = useState(() => normalize(initialLinks));
+  const [saving, setSaving] = useState(false);
+  const [savedFlash, setSavedFlash] = useState(false);
+  const [error, setError] = useState("");
+
+  // Reset whenever we point at a different item
+  useEffect(() => {
+    setLinks(normalize(initialLinks));
+    setSavedFlash(false);
+    setError("");
+  }, [itemId]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const addLink   = () => setLinks(prev => [...prev, { label: "", url: "" }]);
+  const updateAt  = (i, field, val) => setLinks(prev => prev.map((l, idx) => idx === i ? { ...l, [field]: val } : l));
+  const removeAt  = (i) => setLinks(prev => prev.filter((_, idx) => idx !== i));
+
+  const save = async () => {
+    if (!itemId) { setError("Assign this to a student first to save links."); return; }
+    const cleaned = links
+      .map(l => ({ label: (l.label || "").trim(), url: (l.url || "").trim() }))
+      .filter(l => l.label || l.url);
+    setSaving(true);
+    setError("");
+    try {
+      const { error: upErr } = await supabase
+        .from("lesson_plan_items")
+        .update({ resource_links: cleaned })
+        .eq("id", itemId);
+      if (upErr) throw upErr;
+      setSavedFlash(true);
+      setTimeout(() => setSavedFlash(false), 2000);
+      onSaved?.(cleaned);
+    } catch (e) {
+      console.error(e);
+      setError(e.message || "Couldn't save.");
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <div style={{ marginTop: 14, padding: 14, border: "1px solid var(--cream-dark, #F2E9DC)", borderRadius: 12, background: "#fff" }}>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 8, gap: 8 }}>
+        <div style={{ fontSize: "0.82rem", fontWeight: 700, color: "var(--green, #4A7C5F)", textTransform: "uppercase", letterSpacing: "0.05em" }}>
+          🔗 Resource Links
+        </div>
+        {savedFlash && <span style={{ fontSize: "0.78rem", color: "var(--green, #4A7C5F)", fontWeight: 700 }}>✓ Saved</span>}
+      </div>
+
+      {links.length === 0 && (
+        <div style={{ fontSize: "0.82rem", color: "var(--text-muted, #8A7968)", marginBottom: 10 }}>
+          Add helpful videos, reference sheets, or extra practice — the student sees these on their assignment page.
+        </div>
+      )}
+
+      <div style={{ display: "flex", flexDirection: "column", gap: 8, marginBottom: 10 }}>
+        {links.map((l, i) => (
+          <div key={i} style={{ display: "flex", gap: 6, alignItems: "stretch", flexWrap: "wrap" }}>
+            <input
+              placeholder='Label (e.g. "Watch this first")'
+              value={l.label}
+              onChange={e => updateAt(i, "label", e.target.value)}
+              style={{ flex: "1 1 180px", minWidth: 0, padding: "8px 10px", borderRadius: 8, border: "1px solid var(--cream-dark, #F2E9DC)", fontSize: "0.88rem" }}
+            />
+            <input
+              placeholder="https://..."
+              value={l.url}
+              onChange={e => updateAt(i, "url", e.target.value)}
+              style={{ flex: "2 1 240px", minWidth: 0, padding: "8px 10px", borderRadius: 8, border: "1px solid var(--cream-dark, #F2E9DC)", fontSize: "0.88rem" }}
+            />
+            <button
+              type="button"
+              onClick={() => removeAt(i)}
+              title="Remove"
+              style={{ width: 36, padding: 0, border: 0, borderRadius: 8, background: "var(--cream-dark, #F2E9DC)", color: "#8a7968", fontSize: "1.1rem", cursor: "pointer" }}
+            >×</button>
+          </div>
+        ))}
+      </div>
+
+      <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+        <button
+          type="button"
+          onClick={addLink}
+          style={{ border: "1px dashed var(--cream-dark, #F2E9DC)", background: "transparent", borderRadius: 8, padding: "7px 12px", fontSize: "0.85rem", cursor: "pointer", color: "var(--text-muted, #8A7968)" }}
+        >+ Add Link</button>
+        <button
+          type="button"
+          onClick={save}
+          disabled={saving || !itemId}
+          className="btn-primary"
+          style={{ width: "auto", padding: "8px 16px", fontSize: "0.85rem", opacity: !itemId ? 0.5 : 1 }}
+        >
+          {saving ? "Saving..." : "Save Links"}
+        </button>
+      </div>
+
+      {!itemId && (
+        <div style={{ fontSize: "0.78rem", color: "var(--text-muted, #8A7968)", marginTop: 8 }}>
+          Tip: assign this to a student first using the box above — then your links can be saved.
+        </div>
+      )}
+      {error && (
+        <div style={{ background: "#fde8e8", color: "#c0392b", borderRadius: 8, padding: "8px 12px", fontSize: "0.82rem", marginTop: 8 }}>⚠️ {error}</div>
+      )}
+    </div>
+  );
+}
+
+function AssignToPlanRow({ kidId, kidName, getEntry, onAssignToPlan, onAssigned }) {
   const [date, setDate] = useState(defaultAssignDate);
   const [state, setState] = useState("idle");
   const [errMsg, setErrMsg] = useState("");
@@ -2547,6 +3253,7 @@ function AssignToPlanRow({ kidId, kidName, getEntry, onAssignToPlan }) {
       const item = await onAssignToPlan({ kidId, date, generation: getEntry() });
       const url = `https://homeroom.pro/a/${item.assignment_token}`;
       setLastUrl(url);
+      onAssigned?.(item);
       const ok = await copyToClipboard(url);
       setState(ok ? "copied" : "ready");
       setTimeout(() => setState(curr => curr === "copied" ? "ready" : curr), 2500);
@@ -2594,6 +3301,7 @@ function GenerationModal({ tool, kids, onClose, onSave, onAssignToPlan }) {
   const [loading, setLoading] = useState(false);
   const [output, setOutput] = useState("");
   const [saved, setSaved] = useState(false);
+  const [assignedItem, setAssignedItem] = useState(null);
 
   const selectedKid = kids.find(k => String(k.id) === String(kidId));
   const subjects = selectedKid?.subjects || [];
@@ -2602,6 +3310,7 @@ function GenerationModal({ tool, kids, onClose, onSave, onAssignToPlan }) {
     setLoading(true);
     setOutput("");
     setSaved(false);
+    setAssignedItem(null);
     const kid = selectedKid;
     const prompt = buildPrompt(tool, kid, subject, topic);
     try {
@@ -2685,17 +3394,24 @@ function GenerationModal({ tool, kids, onClose, onSave, onAssignToPlan }) {
         )}
 
         {output && onAssignToPlan && (
-          <AssignToPlanRow
-            kidId={kidId}
-            kidName={selectedKid?.name}
-            getEntry={() => ({
-              toolTitle: tool.title,
-              subject,
-              topic,
-              content: output,
-            })}
-            onAssignToPlan={onAssignToPlan}
-          />
+          <>
+            <AssignToPlanRow
+              kidId={kidId}
+              kidName={selectedKid?.name}
+              getEntry={() => ({
+                toolTitle: tool.title,
+                subject,
+                topic,
+                content: output,
+              })}
+              onAssignToPlan={onAssignToPlan}
+              onAssigned={(item) => setAssignedItem(item)}
+            />
+            <ResourceLinksEditor
+              itemId={assignedItem?.id || null}
+              initialLinks={assignedItem?.resource_links || []}
+            />
+          </>
         )}
 
         <div className="modal-footer">
@@ -3541,6 +4257,34 @@ function StudentProfileModal({
 
 // ─── History Viewer Modal ─────────────────────────────────────────────────────
 function HistoryViewer({ item, onClose, onDelete, onAssignToPlan }) {
+  const [assignedItem, setAssignedItem] = useState(null);
+
+  // Look up any existing lesson_plan_item that came from this generation so the
+  // ResourceLinksEditor can display previously-saved links.
+  useEffect(() => {
+    if (!item?.kidId) { setAssignedItem(null); return; }
+    let cancelled = false;
+    (async () => {
+      const taskTitle = `${item.toolTitle}: ${item.topic}`;
+      const { data: plans } = await supabase
+        .from("lesson_plans").select("id").eq("kid_id", item.kidId);
+      if (cancelled) return;
+      if (!plans || plans.length === 0) { setAssignedItem(null); return; }
+      const { data: rows } = await supabase
+        .from("lesson_plan_items")
+        .select("id, resource_links, assignment_token")
+        .in("plan_id", plans.map(p => p.id))
+        .eq("subject", item.subject || "")
+        .eq("task_title", taskTitle)
+        .order("created_at", { ascending: false })
+        .limit(1);
+      if (cancelled) return;
+      if (rows && rows[0]) setAssignedItem(rows[0]);
+      else setAssignedItem(null);
+    })();
+    return () => { cancelled = true; };
+  }, [item?.id, item?.kidId, item?.toolTitle, item?.topic, item?.subject]);
+
   const handlePrint = () => {
     const win = window.open("", "_blank");
     win.document.write(`<html><head><title>${item.toolTitle} — ${item.topic}</title>
@@ -3567,17 +4311,24 @@ function HistoryViewer({ item, onClose, onDelete, onAssignToPlan }) {
         <div style={{ fontWeight: 700, fontSize: "1rem", marginBottom: 12, color: "var(--text)" }}>{item.topic}</div>
         <div className="viewer-content">{item.content}</div>
         {onAssignToPlan && item.kidId && (
-          <AssignToPlanRow
-            kidId={item.kidId}
-            kidName={item.kidName}
-            getEntry={() => ({
-              toolTitle: item.toolTitle,
-              subject: item.subject,
-              topic: item.topic,
-              content: item.content,
-            })}
-            onAssignToPlan={onAssignToPlan}
-          />
+          <>
+            <AssignToPlanRow
+              kidId={item.kidId}
+              kidName={item.kidName}
+              getEntry={() => ({
+                toolTitle: item.toolTitle,
+                subject: item.subject,
+                topic: item.topic,
+                content: item.content,
+              })}
+              onAssignToPlan={onAssignToPlan}
+              onAssigned={(it) => setAssignedItem(it)}
+            />
+            <ResourceLinksEditor
+              itemId={assignedItem?.id || null}
+              initialLinks={assignedItem?.resource_links || []}
+            />
+          </>
         )}
         <div className="viewer-footer">
           <button className="btn-secondary danger" style={{ color: "#c0392b" }}
@@ -3591,12 +4342,957 @@ function HistoryViewer({ item, onClose, onDelete, onAssignToPlan }) {
 }
 
 // ─── Dashboard ────────────────────────────────────────────────────────────────
+// ─── Sunday Planning Flow ────────────────────────────────────────────────────
+// Normalize a "Mon" / "Monday" / "Tue" / etc. into the full DAY_NAMES form.
+function normalizeDay(d) {
+  if (!d) return null;
+  const lower = String(d).toLowerCase().slice(0, 3);
+  const map = { mon: "Monday", tue: "Tuesday", wed: "Wednesday", thu: "Thursday", fri: "Friday" };
+  return map[lower] || null;
+}
+
+function orderedScheduleDays(days) {
+  const set = new Set((days || []).map(normalizeDay).filter(Boolean));
+  return DAY_NAMES.filter(d => set.has(d));
+}
+
+function buildSundayPrompt(tool, kid, subject, topic, description, carryover) {
+  const base = `Student: ${kid?.name}, ${kid?.grade}, learning style: ${kid?.learningStyle || "general"}.\nSubject: ${subject}.\nTopic this week: ${topic}.${description ? `\nWhat to cover: ${description}` : ""}${carryover ? `\nCarryover from last week: ${carryover}` : ""}`;
+  switch (tool.id) {
+    case "lesson":    return `${base}\n\nCreate a detailed, engaging weekly lesson plan tailored to this student's learning style. Include clear daily objectives, activities, and any materials needed. Keep it focused on this week's topic.`;
+    case "worksheet": return `${base}\n\nCreate a practice worksheet with 10-15 varied problems or activities for this week's topic. Make it age-appropriate and engaging.`;
+    case "quiz":      return `${base}\n\nCreate a 10-question quiz covering this week's topic, with an answer key. Mix question types (multiple choice, short answer, fill-in-the-blank).`;
+    default:          return `${base}\n\nCreate helpful homeschool material for this week.`;
+  }
+}
+
+function SundayPlanningFlow({
+  kid,
+  weekStartDate,
+  onLoadScheduleRules,
+  onLoadSemesterPlanWeekFor,
+  onLoadWeeklyCheckpoint,
+  onSaveWeeklyCheckpoint,
+  onSaveLessonPlan,
+  onClose,
+}) {
+  const [step, setStep] = useState(1);
+  const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState("");
+
+  // Step 1
+  const [lastWeekTopics, setLastWeekTopics] = useState({});
+  const [completionStatus, setCompletionStatus] = useState({}); // {subject: 'yes'|'partial'|'no'}
+  const [carryoverText, setCarryoverText] = useState({});      // {subject: ""}
+
+  // Step 2
+  const [thisWeekTopics, setThisWeekTopics] = useState({}); // editable: {subject: {topic, description}}
+  const [subjectDays, setSubjectDays] = useState({});
+
+  // Step 3
+  const [generating, setGenerating] = useState(false);
+  const [progress, setProgress] = useState({}); // {subject: 'pending'|'generating'|'done'|'error'}
+  const [savedItemCount, setSavedItemCount] = useState(0);
+  const [done, setDone] = useState(false);
+  const [genError, setGenError] = useState("");
+
+  const weekDate = useMemo(() => new Date(weekStartDate + "T00:00:00"), [weekStartDate]);
+  const lastWeekIso = useMemo(() => {
+    const d = new Date(weekDate);
+    d.setDate(d.getDate() - 7);
+    return isoLocalDate(d);
+  }, [weekDate]);
+  const fridayDate = useMemo(() => addDays(weekDate, 4), [weekDate]);
+  const weekRangeStr = `${fmtMonthDay(weekDate)} – ${fmtMonthDay(fridayDate)}, ${weekDate.getFullYear()}`;
+
+  // Load up everything
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      setLoading(true);
+      setLoadError("");
+      try {
+        const [last, current, schedule, checkpoint] = await Promise.all([
+          onLoadSemesterPlanWeekFor({ kidId: kid.id, weekStartDate: lastWeekIso }),
+          onLoadSemesterPlanWeekFor({ kidId: kid.id, weekStartDate }),
+          onLoadScheduleRules(kid.id),
+          onLoadWeeklyCheckpoint({ kidId: kid.id, weekStartDate }),
+        ]);
+        if (cancelled) return;
+        setLastWeekTopics(last || {});
+        setThisWeekTopics(current || {});
+        setSubjectDays(schedule?.subjectDays || {});
+        // If there's an existing checkpoint and it's already approved+generated, jump to a "already done" state
+        if (checkpoint?.generated_at) {
+          setDone(true);
+          setStep(3);
+        }
+      } catch (e) {
+        console.error("Sunday planning load:", e);
+        if (!cancelled) setLoadError(e.message || "Failed to load");
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [kid.id, weekStartDate, lastWeekIso]);
+
+  // Subjects that are scheduled this week
+  const subjectsThisWeek = useMemo(
+    () => (kid.subjects || []).filter(s => orderedScheduleDays(subjectDays[s]).length > 0),
+    [kid.subjects, subjectDays]
+  );
+
+  const carryoverPerSubject = useMemo(() => {
+    const out = {};
+    Object.entries(carryoverText).forEach(([subj, txt]) => {
+      const status = completionStatus[subj];
+      if ((status === "partial" || status === "no") && txt && txt.trim()) {
+        out[subj] = txt.trim();
+      }
+    });
+    return out;
+  }, [carryoverText, completionStatus]);
+
+  // Subjects that show on the carryover step (i.e., had something last week)
+  const lastWeekSubjects = (kid.subjects || []).filter(s => lastWeekTopics[s]);
+
+  // ── Step 1 → Step 2 ──
+  const handleStep1Next = async () => {
+    const lines = [];
+    Object.entries(carryoverPerSubject).forEach(([subj, note]) => {
+      lines.push(`${subj}: ${note}`);
+    });
+    const notes = lines.join("\n\n");
+    try {
+      await onSaveWeeklyCheckpoint({
+        kidId: kid.id,
+        weekStartDate,
+        carryoverNotes: notes || null,
+      });
+      setStep(2);
+    } catch (e) {
+      console.error(e);
+      alert("Couldn't save carryover: " + (e.message || "unknown error"));
+    }
+  };
+
+  // ── Step 2 → Step 3 ──
+  const handleStep2Approve = async () => {
+    try {
+      await onSaveWeeklyCheckpoint({
+        kidId: kid.id,
+        weekStartDate,
+        approvedAt: new Date().toISOString(),
+      });
+      setStep(3);
+    } catch (e) {
+      console.error(e);
+      alert("Couldn't save approval: " + (e.message || "unknown error"));
+    }
+  };
+
+  // ── Step 3 generate ──
+  const updateThisWeekTopic = (subject, field, value) => {
+    setThisWeekTopics(prev => ({
+      ...prev,
+      [subject]: { ...(prev[subject] || {}), [field]: value },
+    }));
+  };
+
+  const generateAll = async () => {
+    setGenerating(true);
+    setGenError("");
+    setProgress(Object.fromEntries(subjectsThisWeek.map(s => [s, "pending"])));
+    const collected = [];
+
+    for (const subject of subjectsThisWeek) {
+      setProgress(prev => ({ ...prev, [subject]: "generating" }));
+      const days = orderedScheduleDays(subjectDays[subject]);
+      const dayCount = days.length;
+      const tdata = thisWeekTopics[subject] || {};
+      const topic = (tdata.topic || `Week's content`).trim();
+      const description = (tdata.description || "").trim();
+      const carryover = carryoverPerSubject[subject];
+
+      // Build the per-task list for this subject
+      const tasks = [];
+      tasks.push({ tool: TOOLS.find(t => t.id === "worksheet"), assignDay: days[0] });
+      if (dayCount > 2) {
+        tasks.push({ tool: TOOLS.find(t => t.id === "lesson"), assignDay: days[Math.min(1, days.length - 1)] });
+      }
+      // Quiz on the last scheduled day of this subject (when there is one)
+      if (dayCount > 0) {
+        tasks.push({ tool: TOOLS.find(t => t.id === "quiz"), assignDay: days[days.length - 1] });
+      }
+
+      try {
+        for (const t of tasks) {
+          const promptText = buildSundayPrompt(t.tool, kid, subject, topic, description, carryover);
+          const res = await fetch("/api/generate", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              max_tokens: 4096,
+              messages: [{ role: "user", content: promptText }],
+            }),
+          });
+          const data = await res.json();
+          if (!res.ok) throw new Error(data?.error || "API error");
+          const text = (data.content || []).map(b => b.text || "").join("");
+          collected.push({
+            day: t.assignDay,
+            subject,
+            task_title: `${t.tool.title}: ${topic}`,
+            content: text,
+          });
+        }
+        setProgress(prev => ({ ...prev, [subject]: "done" }));
+      } catch (e) {
+        console.error(`Gen error for ${subject}:`, e);
+        setProgress(prev => ({ ...prev, [subject]: "error" }));
+      }
+    }
+
+    if (collected.length === 0) {
+      setGenError("No materials were generated. Check your network and try again.");
+      setGenerating(false);
+      return;
+    }
+
+    try {
+      await onSaveLessonPlan({ kidId: kid.id, weekStartDate, items: collected });
+      await onSaveWeeklyCheckpoint({
+        kidId: kid.id,
+        weekStartDate,
+        generatedAt: new Date().toISOString(),
+      });
+      setSavedItemCount(collected.length);
+      setDone(true);
+    } catch (e) {
+      console.error(e);
+      setGenError("Couldn't save the generated plan: " + (e.message || "unknown error"));
+    } finally {
+      setGenerating(false);
+    }
+  };
+
+  // ── Render ──
+  const overlayStyle = {
+    position: "fixed", inset: 0, background: "rgba(0,0,0,0.5)",
+    zIndex: 1000, display: "flex", alignItems: "center", justifyContent: "center", padding: 16,
+  };
+  const cardStyle = {
+    background: "var(--cream, #FDF8F3)", borderRadius: 16, width: "100%", maxWidth: 720,
+    maxHeight: "90vh", display: "flex", flexDirection: "column", boxShadow: "0 16px 48px rgba(0,0,0,0.2)",
+  };
+  const headerStyle = {
+    padding: "18px 24px 12px", borderBottom: "1px solid var(--cream-dark, #F2E9DC)",
+    display: "flex", alignItems: "center", justifyContent: "space-between",
+  };
+  const bodyStyle = { padding: "16px 24px 20px", overflowY: "auto", flex: 1 };
+  const footerStyle = { padding: "12px 24px 18px", borderTop: "1px solid var(--cream-dark, #F2E9DC)", display: "flex", gap: 12 };
+
+  return (
+    <div style={overlayStyle} onClick={e => e.target === e.currentTarget && onClose()}>
+      <div style={cardStyle}>
+        <div style={headerStyle}>
+          <div>
+            <div style={{ fontSize: "0.78rem", color: "var(--text-muted, #8A7968)", fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.05em" }}>
+              Sunday Planning · {kid.name} · Week of {fmtMonthDay(weekDate)}
+            </div>
+            <h2 style={{ margin: "4px 0 0", fontSize: "1.4rem", color: "var(--green, #4A7C5F)" }}>
+              {step === 1 && "Carryover Check"}
+              {step === 2 && "This Week's Plan"}
+              {step === 3 && (done ? "All Set!" : "Generate Materials")}
+            </h2>
+          </div>
+          <button
+            onClick={onClose}
+            style={{ background: "transparent", border: 0, fontSize: "1.4rem", cursor: "pointer", color: "var(--text-muted, #8A7968)", padding: 4 }}
+            title="Close"
+          >×</button>
+        </div>
+
+        <div style={bodyStyle}>
+          {loading && <div style={{ padding: 32, textAlign: "center", color: "var(--text-muted, #8A7968)" }}>Loading...</div>}
+          {loadError && !loading && (
+            <div style={{ background: "#fde8e8", color: "#c0392b", borderRadius: 8, padding: "10px 14px", fontSize: "0.85rem" }}>⚠️ {loadError}</div>
+          )}
+
+          {!loading && !loadError && step === 1 && (
+            <>
+              {lastWeekSubjects.length === 0 ? (
+                <div style={{ padding: 16, background: "var(--green-pale, #EDF5F0)", color: "var(--green, #4A7C5F)", borderRadius: 10, lineHeight: 1.5 }}>
+                  No semester plan entries for last week — looks like this is the first week. We'll skip the carryover check.
+                </div>
+              ) : (
+                lastWeekSubjects.map(subject => {
+                  const last = lastWeekTopics[subject];
+                  const status = completionStatus[subject];
+                  const showCarryover = status === "partial" || status === "no";
+                  return (
+                    <div key={subject} style={{ background: "#fff", border: "1px solid var(--cream-dark, #F2E9DC)", borderRadius: 12, padding: 14, marginBottom: 12 }}>
+                      <div style={{ fontWeight: 700, fontSize: "0.95rem", marginBottom: 4 }}>{subject}</div>
+                      <div style={{ fontSize: "0.85rem", color: "var(--text-muted, #8A7968)", marginBottom: 10 }}>
+                        Last week: <strong style={{ color: "#333" }}>{last.topic}</strong>
+                        {last.description ? ` — ${last.description}` : ""}
+                      </div>
+                      <div style={{ fontSize: "0.85rem", marginBottom: 8 }}>Did {kid.name} complete this?</div>
+                      <div style={{ display: "flex", gap: 8, marginBottom: showCarryover ? 10 : 0 }}>
+                        {[
+                          { id: "yes", label: "Yes" },
+                          { id: "partial", label: "Partially" },
+                          { id: "no", label: "No" },
+                        ].map(opt => {
+                          const active = status === opt.id;
+                          return (
+                            <button
+                              key={opt.id}
+                              type="button"
+                              onClick={() => setCompletionStatus(prev => ({ ...prev, [subject]: opt.id }))}
+                              style={{
+                                border: 0, borderRadius: 999, padding: "7px 14px", cursor: "pointer", fontSize: "0.85rem", fontWeight: 700,
+                                background: active ? "var(--green, #4A7C5F)" : "var(--cream-dark, #F2E9DC)",
+                                color: active ? "#fff" : "#666",
+                              }}
+                            >
+                              {opt.label}
+                            </button>
+                          );
+                        })}
+                      </div>
+                      {showCarryover && (
+                        <textarea
+                          rows={2}
+                          placeholder="What do you want to carry over to this week?"
+                          value={carryoverText[subject] || ""}
+                          onChange={e => setCarryoverText(prev => ({ ...prev, [subject]: e.target.value }))}
+                          style={{ width: "100%", padding: "8px 10px", borderRadius: 8, border: "1px solid var(--cream-dark, #F2E9DC)", fontFamily: "inherit", fontSize: "0.88rem", resize: "vertical" }}
+                        />
+                      )}
+                    </div>
+                  );
+                })
+              )}
+            </>
+          )}
+
+          {!loading && !loadError && step === 2 && (
+            <>
+              <div style={{ fontSize: "0.88rem", color: "var(--text-muted, #8A7968)", marginBottom: 12 }}>
+                Week of {weekRangeStr}. Edit any topic before we generate.
+              </div>
+              {subjectsThisWeek.length === 0 ? (
+                <div style={{ padding: 16, background: "#fff8e1", color: "#7c6a00", borderRadius: 10, lineHeight: 1.5 }}>
+                  No subjects are scheduled this week. Add days to your schedule rules in Students → Profile.
+                </div>
+              ) : (
+                subjectsThisWeek.map(subject => {
+                  const tdata = thisWeekTopics[subject] || {};
+                  const days = orderedScheduleDays(subjectDays[subject]);
+                  const carry = carryoverPerSubject[subject];
+                  return (
+                    <div key={subject} style={{ background: "#fff", border: "1px solid var(--cream-dark, #F2E9DC)", borderRadius: 12, padding: 14, marginBottom: 12 }}>
+                      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 6, gap: 8, flexWrap: "wrap" }}>
+                        <div style={{ fontWeight: 700, fontSize: "0.95rem" }}>{subject}</div>
+                        <div style={{ display: "flex", gap: 4, flexWrap: "wrap" }}>
+                          {days.length === 0 && <span style={{ fontSize: "0.72rem", color: "#999" }}>Not scheduled</span>}
+                          {days.map(d => (
+                            <span key={d} style={{ fontSize: "0.72rem", fontWeight: 700, background: "var(--green-pale, #EDF5F0)", color: "var(--green, #4A7C5F)", padding: "3px 8px", borderRadius: 999 }}>
+                              {d.slice(0, 3)}
+                            </span>
+                          ))}
+                        </div>
+                      </div>
+                      {carry && (
+                        <div style={{ fontSize: "0.78rem", background: "#fff4e0", color: "#8a5a00", borderRadius: 8, padding: "6px 10px", marginBottom: 8 }}>
+                          ↩️ Carryover: {carry}
+                        </div>
+                      )}
+                      <input
+                        value={tdata.topic || ""}
+                        onChange={e => updateThisWeekTopic(subject, "topic", e.target.value)}
+                        placeholder="Topic for this week"
+                        style={{ width: "100%", fontSize: "0.95rem", fontWeight: 700, padding: "6px 8px", border: "1px solid var(--cream-dark, #F2E9DC)", borderRadius: 6, marginBottom: 6 }}
+                      />
+                      <textarea
+                        value={tdata.description || ""}
+                        onChange={e => updateThisWeekTopic(subject, "description", e.target.value)}
+                        placeholder="What to cover (optional notes)"
+                        rows={2}
+                        style={{ width: "100%", fontSize: "0.85rem", padding: "6px 8px", border: "1px solid var(--cream-dark, #F2E9DC)", borderRadius: 6, resize: "vertical", fontFamily: "inherit", lineHeight: 1.4 }}
+                      />
+                    </div>
+                  );
+                })
+              )}
+            </>
+          )}
+
+          {!loading && !loadError && step === 3 && (
+            <>
+              {!done && !generating && (
+                <>
+                  <p style={{ marginBottom: 16, color: "var(--text-muted, #8A7968)" }}>
+                    Ready to generate materials for {subjectsThisWeek.length} subject{subjectsThisWeek.length === 1 ? "" : "s"} this week. Each subject gets a worksheet, plus a lesson plan if it runs 3+ days, plus a quiz on the last scheduled day.
+                  </p>
+                </>
+              )}
+              {(generating || done || Object.keys(progress).length > 0) && (
+                <div style={{ display: "flex", flexDirection: "column", gap: 8, marginBottom: 12 }}>
+                  {subjectsThisWeek.map(subject => {
+                    const st = progress[subject] || "pending";
+                    const icon = st === "done" ? "✅" : st === "generating" ? "⏳" : st === "error" ? "⚠️" : "○";
+                    return (
+                      <div key={subject} style={{ display: "flex", alignItems: "center", gap: 10, padding: "8px 12px", borderRadius: 8, background: "#fff", border: "1px solid var(--cream-dark, #F2E9DC)" }}>
+                        <span style={{ fontSize: "1.05rem" }}>{icon}</span>
+                        <span style={{ fontWeight: 700 }}>{subject}</span>
+                        <span style={{ fontSize: "0.78rem", color: "var(--text-muted, #8A7968)", marginLeft: "auto" }}>
+                          {st === "generating" ? "Generating..." : st === "done" ? "Ready" : st === "error" ? "Failed" : ""}
+                        </span>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+              {genError && (
+                <div style={{ background: "#fde8e8", color: "#c0392b", borderRadius: 8, padding: "10px 14px", fontSize: "0.85rem", marginBottom: 12 }}>⚠️ {genError}</div>
+              )}
+              {done && (
+                <div style={{ background: "var(--green-pale, #EDF5F0)", color: "var(--green, #4A7C5F)", borderRadius: 10, padding: "14px 18px", lineHeight: 1.6 }}>
+                  <div style={{ fontWeight: 700, fontSize: "1.05rem", marginBottom: 4 }}>This week is ready! 🎉</div>
+                  <div>{kid.name} has {savedItemCount} assignment{savedItemCount === 1 ? "" : "s"} waiting.</div>
+                </div>
+              )}
+            </>
+          )}
+        </div>
+
+        <div style={footerStyle}>
+          {!loading && !loadError && step === 1 && (
+            <>
+              <button className="btn-secondary" onClick={onClose}>Cancel</button>
+              <button className="btn-primary" style={{ flex: 1 }} onClick={handleStep1Next}>Next →</button>
+            </>
+          )}
+          {!loading && !loadError && step === 2 && (
+            <>
+              <button className="btn-secondary" onClick={() => setStep(1)}>← Back</button>
+              <button className="btn-primary" style={{ flex: 1 }} onClick={handleStep2Approve} disabled={subjectsThisWeek.length === 0}>
+                Approve & Continue →
+              </button>
+            </>
+          )}
+          {!loading && !loadError && step === 3 && !done && (
+            <>
+              <button className="btn-secondary" onClick={() => setStep(2)} disabled={generating}>← Back</button>
+              <button className="btn-primary" style={{ flex: 1 }} onClick={generateAll} disabled={generating || subjectsThisWeek.length === 0}>
+                {generating ? "Generating..." : "Generate All Materials"}
+              </button>
+            </>
+          )}
+          {done && (
+            <button className="btn-primary" style={{ flex: 1 }} onClick={onClose}>Back to Dashboard</button>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── Semester Plan Modal (view-only by default; edits require typing CONFIRM) ─
+function SemesterPlanModal({ kid, onClose, onLoadSemesterPlanWeeksForKid, onUpdateSemesterPlanWeek }) {
+  const [groups, setGroups] = useState({});       // { subject: {planId, weeks: [...]} }
+  const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState("");
+
+  // Edit-flow state. We progress: pendingEditId (warning shown) → unlockedEditId (form shown)
+  const [pendingEditId, setPendingEditId] = useState(null); // week id awaiting CONFIRM
+  const [confirmText, setConfirmText] = useState("");
+  const [unlockedEditId, setUnlockedEditId] = useState(null);
+  const [draftTopic, setDraftTopic] = useState("");
+  const [draftDescription, setDraftDescription] = useState("");
+  const [savingId, setSavingId] = useState(null);
+  const [saveError, setSaveError] = useState("");
+
+  const reload = async () => {
+    setLoading(true);
+    setLoadError("");
+    try {
+      const data = await onLoadSemesterPlanWeeksForKid({ kidId: kid.id });
+      setGroups(data || {});
+    } catch (e) {
+      console.error(e);
+      setLoadError(e.message || "Failed to load");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => { let cancelled = false; (async () => { if (!cancelled) await reload(); })(); return () => { cancelled = true; }; }, [kid.id]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const findWeekById = (id) => {
+    for (const g of Object.values(groups)) {
+      const w = g.weeks.find(x => x.id === id);
+      if (w) return w;
+    }
+    return null;
+  };
+
+  const startEditFlow = (week) => {
+    setPendingEditId(week.id);
+    setConfirmText("");
+    setUnlockedEditId(null);
+    setSaveError("");
+  };
+
+  const cancelEditFlow = () => {
+    setPendingEditId(null);
+    setConfirmText("");
+    setUnlockedEditId(null);
+    setSaveError("");
+  };
+
+  const unlockEdit = () => {
+    const w = findWeekById(pendingEditId);
+    if (!w) return;
+    setDraftTopic(w.topic || "");
+    setDraftDescription(w.description || "");
+    setUnlockedEditId(pendingEditId);
+    setPendingEditId(null);
+    setConfirmText("");
+  };
+
+  const saveEdit = async () => {
+    setSavingId(unlockedEditId);
+    setSaveError("");
+    try {
+      await onUpdateSemesterPlanWeek({
+        id: unlockedEditId,
+        topic: draftTopic,
+        description: draftDescription,
+      });
+      setUnlockedEditId(null);
+      setDraftTopic("");
+      setDraftDescription("");
+      await reload();
+    } catch (e) {
+      console.error(e);
+      setSaveError(e.message || "Couldn't save.");
+    } finally {
+      setSavingId(null);
+    }
+  };
+
+  const overlay = { position: "fixed", inset: 0, background: "rgba(0,0,0,0.5)", zIndex: 1000, display: "flex", alignItems: "center", justifyContent: "center", padding: 16 };
+  const card = { background: "var(--cream, #FDF8F3)", borderRadius: 16, width: "100%", maxWidth: 720, maxHeight: "90vh", display: "flex", flexDirection: "column", boxShadow: "0 16px 48px rgba(0,0,0,0.2)" };
+  const header = { padding: "18px 24px 12px", borderBottom: "1px solid var(--cream-dark, #F2E9DC)", display: "flex", alignItems: "center", justifyContent: "space-between" };
+  const body = { padding: "16px 24px 20px", overflowY: "auto", flex: 1 };
+
+  const subjectNames = Object.keys(groups);
+  const totalWeeks = subjectNames.reduce((sum, s) => sum + (groups[s].weeks?.length || 0), 0);
+
+  return (
+    <div style={overlay} onClick={e => e.target === e.currentTarget && onClose()}>
+      <div style={card}>
+        <div style={header}>
+          <div>
+            <div style={{ fontSize: "0.78rem", color: "var(--text-muted, #8A7968)", fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.05em" }}>
+              Semester Plan · {kid.name}
+            </div>
+            <h2 style={{ margin: "4px 0 0", fontSize: "1.4rem", color: "var(--green, #4A7C5F)" }}>
+              {totalWeeks} week{totalWeeks === 1 ? "" : "s"} across {subjectNames.length} subject{subjectNames.length === 1 ? "" : "s"}
+            </h2>
+          </div>
+          <button onClick={onClose} style={{ background: "transparent", border: 0, fontSize: "1.4rem", cursor: "pointer", color: "var(--text-muted, #8A7968)", padding: 4 }}>×</button>
+        </div>
+
+        <div style={body}>
+          {loading && <div style={{ padding: 32, textAlign: "center", color: "var(--text-muted, #8A7968)" }}>Loading...</div>}
+          {loadError && !loading && (
+            <div style={{ background: "#fde8e8", color: "#c0392b", borderRadius: 8, padding: "10px 14px", fontSize: "0.85rem" }}>⚠️ {loadError}</div>
+          )}
+          {!loading && !loadError && subjectNames.length === 0 && (
+            <div style={{ padding: 16, background: "var(--green-pale, #EDF5F0)", color: "var(--green, #4A7C5F)", borderRadius: 10, lineHeight: 1.5 }}>
+              No semester plan yet for {kid.name}. Run the setup flow to build one.
+            </div>
+          )}
+          {!loading && !loadError && subjectNames.map(subject => {
+            const g = groups[subject];
+            return (
+              <div key={subject} style={{ marginBottom: 18 }}>
+                <div style={{ display: "flex", alignItems: "baseline", gap: 8, marginBottom: 8, flexWrap: "wrap" }}>
+                  <h3 style={{ margin: 0, fontSize: "1.05rem", color: "var(--green, #4A7C5F)" }}>{subject}</h3>
+                  {g.curriculumName && <span style={{ fontSize: "0.78rem", color: "var(--text-muted, #8A7968)" }}>{g.curriculumName}</span>}
+                </div>
+                {g.weeks.length === 0 && (
+                  <div style={{ fontSize: "0.85rem", color: "var(--text-muted, #8A7968)" }}>No weeks saved.</div>
+                )}
+                <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                  {g.weeks.map(w => {
+                    const isUnlocked = unlockedEditId === w.id;
+                    const isPending = pendingEditId === w.id;
+                    return (
+                      <div key={w.id} style={{ background: "#fff", border: "1px solid var(--cream-dark, #F2E9DC)", borderRadius: 12, padding: 12 }}>
+                        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8, marginBottom: 6, flexWrap: "wrap" }}>
+                          <div style={{ fontSize: "0.74rem", color: "var(--text-muted, #8A7968)", fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.05em" }}>
+                            Week {w.weekNumber}{w.weekStartDate ? ` · ${w.weekStartDate}` : ""}
+                          </div>
+                          {!isUnlocked && (
+                            <button
+                              onClick={() => startEditFlow(w)}
+                              title="Edit this week"
+                              style={{ background: "transparent", border: 0, color: "var(--text-muted, #8A7968)", cursor: "pointer", fontSize: "0.95rem", padding: "4px 8px", borderRadius: 6 }}
+                              onMouseEnter={e => e.currentTarget.style.background = "var(--cream-dark, #F2E9DC)"}
+                              onMouseLeave={e => e.currentTarget.style.background = "transparent"}
+                            >
+                              ✏️ Edit
+                            </button>
+                          )}
+                        </div>
+                        {!isUnlocked ? (
+                          <>
+                            <div style={{ fontWeight: 700, fontSize: "0.95rem", marginBottom: 4 }}>{w.topic || <em style={{ color: "var(--text-muted, #8A7968)" }}>(no topic)</em>}</div>
+                            {w.description && <div style={{ fontSize: "0.85rem", color: "#444", lineHeight: 1.45 }}>{w.description}</div>}
+                          </>
+                        ) : (
+                          <div>
+                            <input
+                              value={draftTopic}
+                              onChange={e => setDraftTopic(e.target.value)}
+                              placeholder="Topic"
+                              style={{ width: "100%", fontSize: "0.95rem", fontWeight: 700, padding: "6px 8px", border: "1px solid var(--green, #4A7C5F)", borderRadius: 6, marginBottom: 6 }}
+                            />
+                            <textarea
+                              value={draftDescription}
+                              onChange={e => setDraftDescription(e.target.value)}
+                              placeholder="Description"
+                              rows={3}
+                              style={{ width: "100%", fontSize: "0.85rem", padding: "6px 8px", border: "1px solid var(--green, #4A7C5F)", borderRadius: 6, resize: "vertical", fontFamily: "inherit", lineHeight: 1.45 }}
+                            />
+                            {saveError && (
+                              <div style={{ background: "#fde8e8", color: "#c0392b", borderRadius: 8, padding: "6px 10px", fontSize: "0.8rem", marginTop: 6 }}>⚠️ {saveError}</div>
+                            )}
+                            <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
+                              <button className="btn-secondary" onClick={cancelEditFlow} disabled={savingId === w.id}>Cancel</button>
+                              <button
+                                className="btn-primary"
+                                style={{ width: "auto", padding: "8px 16px" }}
+                                onClick={saveEdit}
+                                disabled={savingId === w.id}
+                              >
+                                {savingId === w.id ? "Saving..." : "Save Changes"}
+                              </button>
+                            </div>
+                          </div>
+                        )}
+                        {isPending && (
+                          <ConfirmEditWarning
+                            week={w}
+                            confirmText={confirmText}
+                            onConfirmTextChange={setConfirmText}
+                            onUnlock={unlockEdit}
+                            onCancel={cancelEditFlow}
+                          />
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function ConfirmEditWarning({ week, confirmText, onConfirmTextChange, onUnlock, onCancel }) {
+  const overlay = { position: "fixed", inset: 0, background: "rgba(0,0,0,0.65)", zIndex: 1100, display: "flex", alignItems: "center", justifyContent: "center", padding: 16 };
+  const card = { background: "#fff", borderRadius: 14, maxWidth: 480, width: "100%", padding: "20px 22px", boxShadow: "0 16px 48px rgba(0,0,0,0.3)" };
+  const okToProceed = confirmText.trim().toUpperCase() === "CONFIRM";
+  return (
+    <div style={overlay} onClick={e => e.target === e.currentTarget && onCancel()}>
+      <div style={card}>
+        <div style={{ fontSize: "1.05rem", fontWeight: 700, marginBottom: 10 }}>
+          ⚠️ Editing Week {week.weekNumber} will affect your semester plan.
+        </div>
+        <div style={{ fontSize: "0.9rem", lineHeight: 1.55, color: "#333", marginBottom: 12 }}>
+          Changing this week's topic may cause the following weeks to fall out of sequence with your curriculum. HomeRoom cannot automatically adjust subsequent weeks.
+        </div>
+        <div style={{ fontSize: "0.85rem", lineHeight: 1.55, color: "#333", marginBottom: 6 }}>
+          We recommend only editing if:
+        </div>
+        <ul style={{ margin: "0 0 12px 20px", padding: 0, fontSize: "0.85rem", color: "#333", lineHeight: 1.55 }}>
+          <li>Your class covered more or less than planned</li>
+          <li>You need to swap topics between weeks</li>
+          <li>You are intentionally restructuring your curriculum</li>
+        </ul>
+        <div style={{ background: "#fff4e0", color: "#7c5400", borderRadius: 8, padding: "10px 12px", fontSize: "0.85rem", marginBottom: 14 }}>
+          This change cannot be undone automatically.
+        </div>
+        <label style={{ display: "block", fontSize: "0.82rem", fontWeight: 700, color: "var(--text-muted, #8A7968)", marginBottom: 6, textTransform: "uppercase", letterSpacing: "0.05em" }}>
+          Type <strong style={{ color: "#c0392b" }}>CONFIRM</strong> to proceed
+        </label>
+        <input
+          autoFocus
+          value={confirmText}
+          onChange={e => onConfirmTextChange(e.target.value)}
+          placeholder="CONFIRM"
+          style={{ width: "100%", padding: "8px 12px", borderRadius: 8, border: "1px solid var(--cream-dark, #F2E9DC)", fontSize: "0.95rem", letterSpacing: "0.05em", marginBottom: 14 }}
+          onKeyDown={e => { if (e.key === "Enter" && okToProceed) onUnlock(); }}
+        />
+        <div style={{ display: "flex", gap: 8 }}>
+          <button className="btn-secondary" onClick={onCancel}>Cancel</button>
+          <button
+            className="btn-primary"
+            style={{ flex: 1, opacity: okToProceed ? 1 : 0.5 }}
+            disabled={!okToProceed}
+            onClick={onUnlock}
+          >
+            Unlock Edit →
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── Help Chat ───────────────────────────────────────────────────────────────
+// Single source of truth for what the in-app help bot knows. Keep this in sync
+// whenever a new feature ships — that's the maintenance cost of this approach.
+const HELP_SYSTEM_PROMPT = `You are HomeRoom's friendly built-in help assistant. HomeRoom is a homeschool planning app for parents (the "teacher") and their kids (the "students").
+
+Your job: answer questions about how to use HomeRoom. Be concise, warm, and specific — point to the exact tab and button. Use bullet steps when there's a click path. If a feature doesn't exist yet, say so honestly. Don't invent features.
+
+Style: short answers (2–4 sentences usually). When listing steps, use numbered or dashed bullets, not paragraphs.
+
+Here's how HomeRoom is laid out:
+
+# Top-level navigation (4 tabs across the top)
+- Dashboard — at-a-glance home: greeting, Sunday Planning banner (when applicable), suggestion banner, kids row, and the Generate Materials grid.
+- Students — pick a kid via the pills at the top, see their profile, schedule rules, weekly plan, and semester plan.
+- Generate — same tools grid as the Dashboard, for going straight to creating a worksheet, quiz, lesson plan, or study guide.
+- History — past weekly plans (with progress bars) and past generated materials (filterable by type).
+
+# First-time setup (5 steps)
+When a new account first signs in, a setup flow runs:
+1. Welcome
+2. Add a Student — name, grade, learning style, subjects
+3. Semester Dates & Break Weeks — pick start/end dates; toggle each week as School or Break
+4. Build My Semester — for each subject: type the curriculum name, pick days/week (1–5), optional PDF upload (DOCX accepted but contents not read), then "Generate Semester Plan". Edit the AI's week-by-week plan inline, then "Looks Good — Lock It In"
+5. Confirmation — click "Enter HomeRoom"
+
+# Sunday Planning
+A green banner appears on the Dashboard on Sundays, OR on any day this week has no plan yet. Each kid that needs planning gets their own banner. Click "Start Sunday Planning" to open a 3-step modal:
+1. Carryover Check — for each subject, "Did [kid] complete [last week's topic]?" (Yes / Partially / No). Picking Partially or No reveals a carryover note field.
+2. This Week's Plan — preview each subject's topic for the week; edit topic and description inline; carryovers show as orange badges; scheduled days show as green pills.
+3. Generate All Materials — generates a worksheet (always), a lesson plan (if 3+ days/week), and a quiz (assigned to the last scheduled day) for each subject. Saves everything to that week's lesson plan.
+
+# Generating individual materials
+Open any tool from the Dashboard or Generate tab. Pick student → subject → topic → click Generate. After the content appears:
+- Click "Assign & Copy Link" with a date — creates a shareable URL at /a/<token> that the student opens on their device.
+- Below, the Resource Links section unlocks. Add labeled URL rows (e.g. "Watch this first" → YouTube). Save Links writes them to that specific assignment.
+
+# Editing the locked semester plan
+Students tab → pick the kid → "📅 View Semester Plan" button at the top right of their profile header. The modal lists every week grouped by subject. Each week has a small "✏️ Edit" icon. Editing requires typing the word CONFIRM in a warning dialog (this is intentional — HomeRoom doesn't auto-cascade changes to subsequent weeks).
+
+# Schedule rules (which days each subject runs)
+Students tab → kid profile → there's a Schedule Rules section. Tell HomeRoom which days each subject runs (Mon/Tue/Wed/Thu/Fri). Sunday Planning uses these to decide where to assign worksheets/lessons/quizzes.
+
+# Public assignment page (the kid's view)
+The kid (no login) opens /a/<token> on their device. They see the task title, any resource links as warm green cards, the assignment content, and a "Mark Complete ✓" button. Once marked complete, the parent sees it reflected in their plan.
+
+# History tab
+Two segments at the top: "Weekly Plans" (past weeks with completion progress bars — clicking one jumps to that week in the Students tab) and "Generated Materials" (every individual worksheet/quiz/etc, filterable by type).
+
+# Things HomeRoom does NOT do yet
+- Multiple parents on one account / shared classrooms
+- Grading or rubric feedback
+- Real DOCX text extraction (PDFs read fully; DOCX is accepted but only the filename + curriculum name are used)
+- Email or SMS reminders
+- A native mobile app (the web app works on mobile browsers)
+
+If a user asks about something not listed above, say honestly: "That's not in HomeRoom right now — but you can ask the developer to add it."`;
+
+function HelpChat() {
+  const [open, setOpen] = useState(false);
+  const [messages, setMessages] = useState([]); // {role: 'user'|'assistant', content: string}
+  const [input, setInput] = useState("");
+  const [loading, setLoading] = useState(false);
+  const scrollRef = useRef(null);
+
+  useEffect(() => {
+    if (scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
+  }, [messages, loading, open]);
+
+  const send = async () => {
+    const text = input.trim();
+    if (!text || loading) return;
+    const next = [...messages, { role: "user", content: text }];
+    setMessages(next);
+    setInput("");
+    setLoading(true);
+    try {
+      const res = await fetch("/api/generate", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          max_tokens: 1024,
+          system: HELP_SYSTEM_PROMPT,
+          messages: next.map(m => ({ role: m.role, content: m.content })),
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data?.error || "API error");
+      const reply = (data.content || []).map(b => b.text || "").join("") || "Sorry, I didn't get a reply. Try again?";
+      setMessages(prev => [...prev, { role: "assistant", content: reply }]);
+    } catch (e) {
+      console.error(e);
+      setMessages(prev => [...prev, { role: "assistant", content: "Hmm, I couldn't reach the help service. Check your connection and try again." }]);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const fab = {
+    position: "fixed", right: 22, bottom: 22, zIndex: 950,
+    width: 56, height: 56, borderRadius: "50%", border: 0, cursor: "pointer",
+    background: "var(--green, #4A7C5F)", color: "#fff", fontSize: "1.5rem",
+    boxShadow: "0 6px 18px rgba(74,124,95,0.35)",
+    display: "flex", alignItems: "center", justifyContent: "center",
+  };
+
+  const panel = {
+    position: "fixed", right: 22, bottom: 22, zIndex: 950,
+    width: "min(380px, calc(100vw - 28px))",
+    height: "min(560px, calc(100vh - 100px))",
+    background: "var(--cream, #FDF8F3)",
+    borderRadius: 16,
+    boxShadow: "0 16px 48px rgba(0,0,0,0.22)",
+    display: "flex", flexDirection: "column", overflow: "hidden",
+    border: "1px solid var(--cream-dark, #F2E9DC)",
+  };
+
+  const headerRow = {
+    padding: "12px 14px",
+    background: "var(--green, #4A7C5F)", color: "#fff",
+    display: "flex", alignItems: "center", justifyContent: "space-between",
+  };
+
+  const messageList = {
+    flex: 1, overflowY: "auto", padding: 12,
+    display: "flex", flexDirection: "column", gap: 8,
+  };
+
+  const userBubble = {
+    alignSelf: "flex-end", maxWidth: "85%",
+    background: "var(--green, #4A7C5F)", color: "#fff",
+    padding: "8px 12px", borderRadius: 14, borderBottomRightRadius: 4,
+    fontSize: "0.88rem", lineHeight: 1.45, whiteSpace: "pre-wrap", wordBreak: "break-word",
+  };
+
+  const botBubble = {
+    alignSelf: "flex-start", maxWidth: "90%",
+    background: "#fff", border: "1px solid var(--cream-dark, #F2E9DC)",
+    padding: "8px 12px", borderRadius: 14, borderBottomLeftRadius: 4,
+    fontSize: "0.88rem", lineHeight: 1.5, color: "#333",
+    whiteSpace: "pre-wrap", wordBreak: "break-word",
+  };
+
+  const inputRow = {
+    padding: 10, borderTop: "1px solid var(--cream-dark, #F2E9DC)",
+    display: "flex", gap: 8, background: "#fff",
+  };
+
+  if (!open) {
+    return (
+      <button
+        type="button"
+        onClick={() => setOpen(true)}
+        style={fab}
+        title="Help"
+        aria-label="Open help chat"
+      >
+        💬
+      </button>
+    );
+  }
+
+  return (
+    <div style={panel}>
+      <div style={headerRow}>
+        <div>
+          <div style={{ fontSize: "0.72rem", opacity: 0.85, fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.05em" }}>HomeRoom Help</div>
+          <div style={{ fontSize: "0.95rem", fontWeight: 700 }}>Ask me how to use the site</div>
+        </div>
+        <button
+          onClick={() => setOpen(false)}
+          aria-label="Close help"
+          style={{ background: "transparent", border: 0, color: "#fff", fontSize: "1.3rem", cursor: "pointer", padding: 4, lineHeight: 1 }}
+        >×</button>
+      </div>
+
+      <div ref={scrollRef} style={messageList}>
+        {messages.length === 0 && (
+          <div style={{ ...botBubble, alignSelf: "stretch", maxWidth: "100%" }}>
+            👋 Hi! I'm built into HomeRoom and can answer questions about how to use it.
+            {"\n\n"}
+            Try asking:
+            {"\n"}• "How do I add a break week?"
+            {"\n"}• "Where do I edit my semester plan?"
+            {"\n"}• "What does Sunday Planning do?"
+          </div>
+        )}
+        {messages.map((m, i) => (
+          <div key={i} style={m.role === "user" ? userBubble : botBubble}>{m.content}</div>
+        ))}
+        {loading && (
+          <div style={{ ...botBubble, color: "var(--text-muted, #8A7968)", fontStyle: "italic" }}>thinking...</div>
+        )}
+      </div>
+
+      <div style={inputRow}>
+        <textarea
+          value={input}
+          onChange={e => setInput(e.target.value)}
+          onKeyDown={e => {
+            if (e.key === "Enter" && !e.shiftKey) {
+              e.preventDefault();
+              send();
+            }
+          }}
+          placeholder="Ask a question..."
+          rows={1}
+          style={{
+            flex: 1, resize: "none", border: "1px solid var(--cream-dark, #F2E9DC)",
+            borderRadius: 10, padding: "8px 10px", fontFamily: "inherit", fontSize: "0.88rem",
+            lineHeight: 1.4, maxHeight: 100,
+          }}
+        />
+        <button
+          onClick={send}
+          disabled={loading || !input.trim()}
+          className="btn-primary"
+          style={{ width: "auto", padding: "8px 14px", fontSize: "0.85rem" }}
+        >
+          Send
+        </button>
+      </div>
+    </div>
+  );
+}
+
 function Dashboard({
   user, kids, semesterDates, lessonPlans, onAddKid,
   onSaveGeneration, onDeleteGeneration, onSaveCurriculum,
   onLoadScheduleRules, onSaveScheduleRules,
   onLoadLessonPlan, onSaveLessonPlan, onAssignLessonPlanItem,
   onAssignGenerationToPlan,
+  onLoadSemesterPlanWeekFor, onLoadSemesterPlanWeeksForKid, onUpdateSemesterPlanWeek,
+  onLoadWeeklyCheckpoint, onSaveWeeklyCheckpoint,
   onUpdateKid, onAddSubject, onDeleteSubject, onUpdateSubjectResources, onUploadAvatar,
   onSignOut
 }) {
@@ -3609,6 +5305,20 @@ function Dashboard({
   const [studentViewKidId, setStudentViewKidId] = useState(null);
   const [studentViewWeekStart, setStudentViewWeekStart] = useState(null);
   const [curriculumUploadFor, setCurriculumUploadFor] = useState(null);
+  const [planningKidId, setPlanningKidId] = useState(null);
+  const [semesterPlanForKidId, setSemesterPlanForKidId] = useState(null);
+
+  // Sunday Planning: this week's Monday + which kids need a plan
+  const thisMonday = useMemo(() => getMondayOf(new Date()), []);
+  const thisMondayIso = isoLocalDate(thisMonday);
+  const isSunday = new Date().getDay() === 0;
+  const kidsNeedingPlanning = useMemo(() => {
+    return kids.filter(k => {
+      const hasPlan = lessonPlans.some(p => p.kidId === k.id && p.weekStartDate === thisMondayIso);
+      return !hasPlan || isSunday;
+    });
+  }, [kids, lessonPlans, thisMondayIso, isSunday]);
+  const planningKid = planningKidId ? kids.find(k => k.id === planningKidId) : null;
 
   // Default to first kid when kids load
   useEffect(() => {
@@ -3681,6 +5391,53 @@ function Dashboard({
               <h2>Good morning, {firstName}! ☀️</h2>
               <p>Week {weekNum} of your semester. Here's what's on the agenda.</p>
             </div>
+
+            {kidsNeedingPlanning.length > 0 && (
+              <div style={{ display: "flex", flexDirection: "column", gap: 10, marginBottom: 16 }}>
+                {kidsNeedingPlanning.map(kid => (
+                  <div
+                    key={kid.id}
+                    style={{
+                      background: "linear-gradient(135deg, var(--green, #4A7C5F), #6a9d80)",
+                      borderRadius: 14,
+                      padding: "16px 18px",
+                      color: "#fff",
+                      display: "flex",
+                      alignItems: "center",
+                      justifyContent: "space-between",
+                      gap: 12,
+                      flexWrap: "wrap",
+                      boxShadow: "0 4px 14px rgba(74,124,95,0.25)",
+                    }}
+                  >
+                    <div style={{ minWidth: 0 }}>
+                      <div style={{ fontSize: "0.74rem", fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.06em", opacity: 0.85, marginBottom: 4 }}>
+                        🗓️ Sunday Planning
+                      </div>
+                      <div style={{ fontSize: "1.02rem", fontWeight: 700 }}>
+                        Ready to plan {kid.name}'s week?
+                      </div>
+                    </div>
+                    <button
+                      onClick={() => setPlanningKidId(kid.id)}
+                      style={{
+                        background: "#fff",
+                        color: "var(--green, #4A7C5F)",
+                        border: 0,
+                        borderRadius: 999,
+                        padding: "9px 18px",
+                        fontWeight: 700,
+                        fontSize: "0.88rem",
+                        cursor: "pointer",
+                        whiteSpace: "nowrap",
+                      }}
+                    >
+                      Start Sunday Planning →
+                    </button>
+                  </div>
+                ))}
+              </div>
+            )}
 
             {suggestionKid && (
               <div className="suggestion-banner">
@@ -3763,9 +5520,18 @@ function Dashboard({
 
             {studentViewKid ? (
               <>
-                <div className="student-page-header">
-                  <h2>{studentViewKid.name}</h2>
-                  <div className="student-page-sub">{studentViewKid.grade}{studentViewKid.learningStyle ? ` · ${studentViewKid.learningStyle} learner` : ""}</div>
+                <div className="student-page-header" style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12, flexWrap: "wrap" }}>
+                  <div>
+                    <h2>{studentViewKid.name}</h2>
+                    <div className="student-page-sub">{studentViewKid.grade}{studentViewKid.learningStyle ? ` · ${studentViewKid.learningStyle} learner` : ""}</div>
+                  </div>
+                  <button
+                    className="btn-secondary"
+                    style={{ width: "auto", padding: "8px 16px" }}
+                    onClick={() => setSemesterPlanForKidId(studentViewKid.id)}
+                  >
+                    📅 View Semester Plan
+                  </button>
                 </div>
 
                 <WeeklyPlanModal
@@ -3985,6 +5751,36 @@ function Dashboard({
           initialSubject={curriculumUploadFor.subject}
         />
       )}
+
+      {planningKid && (
+        <SundayPlanningFlow
+          key={`${planningKid.id}-${thisMondayIso}`}
+          kid={planningKid}
+          weekStartDate={thisMondayIso}
+          onLoadScheduleRules={onLoadScheduleRules}
+          onLoadSemesterPlanWeekFor={onLoadSemesterPlanWeekFor}
+          onLoadWeeklyCheckpoint={onLoadWeeklyCheckpoint}
+          onSaveWeeklyCheckpoint={onSaveWeeklyCheckpoint}
+          onSaveLessonPlan={onSaveLessonPlan}
+          onClose={() => setPlanningKidId(null)}
+        />
+      )}
+
+      {semesterPlanForKidId && (() => {
+        const kid = kids.find(k => k.id === semesterPlanForKidId);
+        if (!kid) return null;
+        return (
+          <SemesterPlanModal
+            key={kid.id}
+            kid={kid}
+            onClose={() => setSemesterPlanForKidId(null)}
+            onLoadSemesterPlanWeeksForKid={onLoadSemesterPlanWeeksForKid}
+            onUpdateSemesterPlanWeek={onUpdateSemesterPlanWeek}
+          />
+        );
+      })()}
+
+      <HelpChat />
     </div>
   );
 }
@@ -4001,7 +5797,7 @@ function AssignmentPage({ token }) {
     (async () => {
       const { data, error: fetchError } = await supabase
         .from("lesson_plan_items")
-        .select("id, day, subject, task_title, content, status, assignment_token")
+        .select("id, day, subject, task_title, content, status, assignment_token, resource_links")
         .eq("assignment_token", token)
         .maybeSingle();
       if (cancelled) return;
@@ -4061,6 +5857,50 @@ function AssignmentPage({ token }) {
               {item.subject && <span className="assign-subject">{item.subject}</span>}
             </div>
             <h1 className="assign-title">{item.task_title}</h1>
+            {Array.isArray(item.resource_links) && item.resource_links.length > 0 && (
+              <div style={{ margin: "0 0 18px" }}>
+                <div style={{ fontSize: "0.85rem", fontWeight: 700, color: "var(--green, #4A7C5F)", marginBottom: 8 }}>
+                  Your teacher included these resources for you:
+                </div>
+                <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                  {item.resource_links.map((link, i) => (
+                    <a
+                      key={i}
+                      href={link.url}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      style={{
+                        display: "flex",
+                        alignItems: "center",
+                        gap: 12,
+                        padding: "12px 14px",
+                        borderRadius: 12,
+                        background: "linear-gradient(135deg, var(--green-pale, #EDF5F0), #DCEFE0)",
+                        border: "1px solid var(--green, #4A7C5F)",
+                        textDecoration: "none",
+                        color: "var(--green, #4A7C5F)",
+                        transition: "transform 120ms ease, box-shadow 120ms ease",
+                      }}
+                      onMouseEnter={e => { e.currentTarget.style.transform = "translateY(-1px)"; e.currentTarget.style.boxShadow = "0 4px 12px rgba(74,124,95,0.18)"; }}
+                      onMouseLeave={e => { e.currentTarget.style.transform = ""; e.currentTarget.style.boxShadow = ""; }}
+                    >
+                      <span style={{ fontSize: "1.3rem", lineHeight: 1, flexShrink: 0 }}>🔗</span>
+                      <span style={{ flex: 1, minWidth: 0 }}>
+                        <span style={{ display: "block", fontWeight: 700, fontSize: "0.95rem", color: "var(--green, #4A7C5F)" }}>
+                          {link.label || link.url}
+                        </span>
+                        {link.label && link.url && (
+                          <span style={{ display: "block", fontSize: "0.78rem", color: "var(--text-muted, #8A7968)", marginTop: 2, wordBreak: "break-all" }}>
+                            {link.url}
+                          </span>
+                        )}
+                      </span>
+                      <span style={{ fontSize: "0.95rem", flexShrink: 0 }}>↗</span>
+                    </a>
+                  ))}
+                </div>
+              </div>
+            )}
             {item.content && <div className="assign-content">{item.content}</div>}
             <button
               className="btn-primary assign-complete-btn"
@@ -4093,7 +5933,9 @@ export default function HomeRoom() {
   const { user, loading: authLoading, signIn, signUp, signOut } = useAuth();
   const {
     kids, semester, history, lessonPlans, dataLoading, setupDone,
-    saveKid, saveSemester, saveCurriculumWeeks,
+    saveKid, saveSemester, saveCurriculumWeeks, saveSemesterPlan,
+    loadSemesterPlanWeekFor, loadSemesterPlanWeeksForKid, updateSemesterPlanWeek,
+    loadWeeklyCheckpoint, saveWeeklyCheckpoint,
     saveGeneration, deleteGeneration,
     loadScheduleRules, saveScheduleRules,
     loadLessonPlan, saveLessonPlan, assignLessonPlanItem,
@@ -4122,7 +5964,13 @@ export default function HomeRoom() {
   if (!setupDone) return (
     <>
       <style>{styles}</style>
-      <SetupFlow user={user} onComplete={completeSetup} />
+      <SetupFlow
+        user={user}
+        onSaveKid={saveKid}
+        onUpdateKid={updateKid}
+        onSaveSemesterPlan={saveSemesterPlan}
+        onComplete={completeSetup}
+      />
     </>
   );
 
@@ -4144,6 +5992,11 @@ export default function HomeRoom() {
         onSaveLessonPlan={saveLessonPlan}
         onAssignLessonPlanItem={assignLessonPlanItem}
         onAssignGenerationToPlan={assignGenerationToPlan}
+        onLoadSemesterPlanWeekFor={loadSemesterPlanWeekFor}
+        onLoadSemesterPlanWeeksForKid={loadSemesterPlanWeeksForKid}
+        onUpdateSemesterPlanWeek={updateSemesterPlanWeek}
+        onLoadWeeklyCheckpoint={loadWeeklyCheckpoint}
+        onSaveWeeklyCheckpoint={saveWeeklyCheckpoint}
         onUpdateKid={updateKid}
         onAddSubject={addSubjectToKid}
         onDeleteSubject={deleteSubject}
