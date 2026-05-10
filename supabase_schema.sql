@@ -249,3 +249,75 @@ drop policy if exists "Public read avatars" on storage.objects;
 create policy "Public read avatars" on storage.objects
   for select to public
   using (bucket_id = 'avatars');
+
+-- ─────────────────────────────────────────────────────────────
+-- Semester planning, weekly checkpoints, and lesson item extras
+-- ─────────────────────────────────────────────────────────────
+
+-- kids: semester window + break weeks
+alter table kids add column if not exists semester_start_date date;
+alter table kids add column if not exists semester_end_date date;
+alter table kids add column if not exists break_weeks date[];
+
+-- semester_plans: per-subject plan for a kid's semester
+create table if not exists semester_plans (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid not null references profiles(id) on delete cascade,
+  kid_id uuid not null references kids(id) on delete cascade,
+  subject text,
+  curriculum_name text,
+  days_per_week integer,
+  total_weeks integer,
+  created_at timestamptz default now()
+);
+
+-- semester_plan_weeks: weekly breakdown of a semester plan
+create table if not exists semester_plan_weeks (
+  id uuid primary key default gen_random_uuid(),
+  semester_plan_id uuid not null references semester_plans(id) on delete cascade,
+  week_number integer,
+  week_start_date date,
+  topic text,
+  description text,
+  is_break boolean default false,
+  created_at timestamptz default now()
+);
+
+-- lesson_plan_items: resource links + carryover note
+alter table lesson_plan_items add column if not exists resource_links jsonb;
+alter table lesson_plan_items add column if not exists carryover_note text;
+
+-- weekly_checkpoints: end-of-week review/approval per kid
+create table if not exists weekly_checkpoints (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid not null references profiles(id) on delete cascade,
+  kid_id uuid not null references kids(id) on delete cascade,
+  week_start_date date,
+  carryover_notes text,
+  approved_at timestamptz,
+  generated_at timestamptz,
+  created_at timestamptz default now()
+);
+
+-- ─── RLS ─────────────────────────────────────────────────────
+alter table semester_plans enable row level security;
+alter table semester_plan_weeks enable row level security;
+alter table weekly_checkpoints enable row level security;
+
+-- semester_plans: own rows
+create policy "semester_plans: own" on semester_plans
+  for all using (auth.uid() = user_id);
+
+-- semester_plan_weeks: access through plan → user ownership
+create policy "semester_plan_weeks: own via plan" on semester_plan_weeks
+  for all using (
+    exists (
+      select 1 from semester_plans
+      where semester_plans.id = semester_plan_weeks.semester_plan_id
+      and semester_plans.user_id = auth.uid()
+    )
+  );
+
+-- weekly_checkpoints: own rows
+create policy "weekly_checkpoints: own" on weekly_checkpoints
+  for all using (auth.uid() = user_id);
