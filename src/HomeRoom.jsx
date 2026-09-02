@@ -23,9 +23,9 @@ function useAuth() {
     return () => subscription.unsubscribe();
   }, []);
 
-  const signUp = async (email, password, name) => {
+  const signUp = async (email, password, name, userType = "parent") => {
     const { data, error } = await supabase.auth.signUp({
-      email, password, options: { data: { name } }
+      email, password, options: { data: { name, user_type: userType } }
     });
     if (error) throw error;
     // Immediately sign in after signup since email confirm is off
@@ -60,6 +60,7 @@ function useHomeRoom(userId) {
   const [lessonPlans, setLessonPlans] = useState([]);
   const [dataLoading, setDataLoading] = useState(true);
   const [setupDone, setSetupDone] = useState(false);
+  const [userType, setUserType] = useState("parent"); // 'parent' | 'student'
 
   useEffect(() => {
     if (!userId) { setDataLoading(false); return; }
@@ -68,8 +69,15 @@ function useHomeRoom(userId) {
 
   const loadAll = async () => {
     setDataLoading(true);
-    try { await Promise.all([loadKids(), loadSemester(), loadHistory(), loadLessonPlans()]); }
+    try { await Promise.all([loadProfile(), loadKids(), loadSemester(), loadHistory(), loadLessonPlans()]); }
     finally { setDataLoading(false); }
+  };
+
+  const loadProfile = async () => {
+    const { data, error } = await supabase
+      .from("profiles").select("user_type").eq("id", userId).maybeSingle();
+    if (error) { console.error("loadProfile:", error); return; }
+    if (data?.user_type) setUserType(data.user_type);
   };
 
   const loadLessonPlans = async () => {
@@ -100,7 +108,7 @@ function useHomeRoom(userId) {
   const loadKids = async () => {
     const { data, error } = await supabase
       .from("kids")
-      .select(`id, name, grade, learning_style, emoji, avatar_url, semester_start_date, semester_end_date, break_weeks, subjects(id, name, book_title, book_link, curriculum_weeks(week_number, topic, description))`)
+      .select(`id, name, grade, learning_style, emoji, avatar_url, semester_start_date, semester_end_date, break_weeks, subjects(id, name, book_title, book_link, course_code, professor, meeting_days, syllabus_url, syllabus_text, curriculum_weeks(week_number, topic, description))`)
       .eq("user_id", userId)
       .order("created_at");
     if (error) { console.error("loadKids:", error); return; }
@@ -117,6 +125,11 @@ function useHomeRoom(userId) {
         name: s.name,
         bookTitle: s.book_title || "",
         bookLink: s.book_link || "",
+        courseCode: s.course_code || "",
+        professor: s.professor || "",
+        meetingDays: s.meeting_days || [],
+        syllabusUrl: s.syllabus_url || "",
+        syllabusText: s.syllabus_text || "",
         weekCount: s.curriculum_weeks?.length || 0,
       })),
       curriculumWeeks: (k.subjects || []).reduce((acc, s) => {
@@ -137,6 +150,57 @@ function useHomeRoom(userId) {
     }));
     setKids(shaped);
     // setupDone is gated on a saved semester (loadSemester or completeSetup) — kids alone aren't enough.
+  };
+
+  // College-mode: create the "self" kids row that represents the college student themselves.
+  // Returns the kid id. Idempotent — reuses an existing self-row if one exists.
+  const saveSelfKid = async ({ name, classYear, school, emoji = "🎓" }) => {
+    // Reuse existing self-kid if the user re-enters setup.
+    const existing = kids[0];
+    if (existing) return existing.id;
+    const gradeLabel = [classYear, school].filter(Boolean).join(" · ") || "College";
+    const { data, error } = await supabase
+      .from("kids")
+      .insert({ user_id: userId, name, grade: gradeLabel, learning_style: null, emoji })
+      .select().single();
+    if (error) throw error;
+    await loadKids();
+    return data.id;
+  };
+
+  // College-mode: insert a course as a subjects row with the extra college fields.
+  const saveCourse = async ({ kidId, name, courseCode, professor, meetingDays, bookTitle, bookLink, syllabusUrl, syllabusText }) => {
+    const { data, error } = await supabase.from("subjects").insert({
+      kid_id: kidId,
+      name: name.trim(),
+      course_code: courseCode?.trim() || null,
+      professor: professor?.trim() || null,
+      meeting_days: (meetingDays && meetingDays.length) ? meetingDays : null,
+      book_title: bookTitle?.trim() || null,
+      book_link: bookLink?.trim() || null,
+      syllabus_url: syllabusUrl?.trim() || null,
+      syllabus_text: syllabusText?.trim() || null,
+    }).select().single();
+    if (error) throw error;
+    await loadKids();
+    return data.id;
+  };
+
+  // College-mode: update course-level metadata after setup (e.g. from a course-detail modal).
+  const updateCourse = async ({ subjectId, name, courseCode, professor, meetingDays, bookTitle, bookLink, syllabusUrl, syllabusText }) => {
+    const updates = {};
+    if (name !== undefined) updates.name = name;
+    if (courseCode !== undefined) updates.course_code = courseCode || null;
+    if (professor !== undefined) updates.professor = professor || null;
+    if (meetingDays !== undefined) updates.meeting_days = meetingDays && meetingDays.length ? meetingDays : null;
+    if (bookTitle !== undefined) updates.book_title = bookTitle || null;
+    if (bookLink !== undefined) updates.book_link = bookLink || null;
+    if (syllabusUrl !== undefined) updates.syllabus_url = syllabusUrl || null;
+    if (syllabusText !== undefined) updates.syllabus_text = syllabusText || null;
+    if (Object.keys(updates).length === 0) return;
+    const { error } = await supabase.from("subjects").update(updates).eq("id", subjectId);
+    if (error) throw error;
+    await loadKids();
   };
 
   const updateKid = async ({ kidId, name, grade, learningStyle, emoji, avatarUrl, semesterStartDate, semesterEndDate, breakWeeks }) => {
@@ -219,16 +283,23 @@ function useHomeRoom(userId) {
   };
 
   // Look up this-week / last-week semester plan entries for every subject the kid has a plan for.
-  // Returns { [subject]: { topic, description, weekNumber } } for the given week_start_date.
+  // Returns { [subject]: { topic, description, weekNumber, curriculumName, curriculumUrl } }
+  // for the given week_start_date.
   const loadSemesterPlanWeekFor = async ({ kidId, weekStartDate }) => {
     const { data: plans, error: plansErr } = await supabase
       .from("semester_plans")
-      .select("id, subject")
+      .select("id, subject, curriculum_name, curriculum_url")
       .eq("kid_id", kidId);
     if (plansErr) { console.error("loadSemesterPlanWeekFor plans:", plansErr); return {}; }
     if (!plans || !plans.length) return {};
-    const subjectByPlanId = {};
-    plans.forEach(p => { subjectByPlanId[p.id] = p.subject; });
+    const planInfoById = {};
+    plans.forEach(p => {
+      planInfoById[p.id] = {
+        subject: p.subject,
+        curriculumName: p.curriculum_name || "",
+        curriculumUrl: p.curriculum_url || "",
+      };
+    });
     const { data: weeks, error: weeksErr } = await supabase
       .from("semester_plan_weeks")
       .select("semester_plan_id, topic, description, week_number")
@@ -237,8 +308,15 @@ function useHomeRoom(userId) {
     if (weeksErr) { console.error("loadSemesterPlanWeekFor weeks:", weeksErr); return {}; }
     const result = {};
     (weeks || []).forEach(w => {
-      const subj = subjectByPlanId[w.semester_plan_id];
-      if (subj) result[subj] = { topic: w.topic, description: w.description, weekNumber: w.week_number };
+      const info = planInfoById[w.semester_plan_id];
+      if (!info) return;
+      result[info.subject] = {
+        topic: w.topic,
+        description: w.description,
+        weekNumber: w.week_number,
+        curriculumName: info.curriculumName,
+        curriculumUrl: info.curriculumUrl,
+      };
     });
     return result;
   };
@@ -283,11 +361,11 @@ function useHomeRoom(userId) {
 
   // Loads every week from every semester_plan belonging to a kid.
   // Returns groups keyed by subject:
-  //   { [subject]: { planId, curriculumName, daysPerWeek, totalWeeks, weeks: [...] } }
+  //   { [subject]: { planId, curriculumName, curriculumUrl, daysPerWeek, totalWeeks, weeks: [...] } }
   const loadSemesterPlanWeeksForKid = async ({ kidId }) => {
     const { data: plans, error: plansErr } = await supabase
       .from("semester_plans")
-      .select("id, subject, curriculum_name, days_per_week, total_weeks")
+      .select("id, subject, curriculum_name, curriculum_url, days_per_week, total_weeks")
       .eq("kid_id", kidId)
       .order("created_at");
     if (plansErr) { console.error("loadSemesterPlanWeeksForKid plans:", plansErr); return {}; }
@@ -303,6 +381,7 @@ function useHomeRoom(userId) {
       out[p.subject] = {
         planId: p.id,
         curriculumName: p.curriculum_name || "",
+        curriculumUrl: p.curriculum_url || "",
         daysPerWeek: p.days_per_week,
         totalWeeks: p.total_weeks,
         weeks: [],
@@ -337,7 +416,7 @@ function useHomeRoom(userId) {
     return data;
   };
 
-  const saveSemesterPlan = async ({ kidId, subject, curriculumName, daysPerWeek, totalWeeks, weeks }) => {
+  const saveSemesterPlan = async ({ kidId, subject, curriculumName, curriculumUrl, daysPerWeek, totalWeeks, weeks }) => {
     const { data: planRow, error: planErr } = await supabase
       .from("semester_plans")
       .insert({
@@ -345,6 +424,7 @@ function useHomeRoom(userId) {
         kid_id: kidId,
         subject,
         curriculum_name: curriculumName || null,
+        curriculum_url: (curriculumUrl && curriculumUrl.trim()) ? curriculumUrl.trim() : null,
         days_per_week: daysPerWeek || null,
         total_weeks: totalWeeks || null,
       })
@@ -553,8 +633,10 @@ function useHomeRoom(userId) {
   };
 
   return {
+    userType,
     kids, semester, history, lessonPlans, dataLoading, setupDone,
-    saveKid, saveSemester, saveCurriculumWeeks, saveSemesterPlan,
+    saveKid, saveSelfKid, saveCourse, updateCourse,
+    saveSemester, saveCurriculumWeeks, saveSemesterPlan,
     loadSemesterPlanWeekFor, loadSemesterPlanWeeksForKid, updateSemesterPlanWeek,
     loadWeeklyCheckpoint, saveWeeklyCheckpoint,
     saveGeneration, deleteGeneration,
@@ -2408,6 +2490,18 @@ const TOOLS = [
   { id: "studyguide", icon: "🗂️", title: "Study Guide", desc: "Summarize & organize any topic" },
 ];
 
+// College-mode tool set. Different from TOOLS on purpose — college students
+// need study aids, not lesson plans they'd give to themselves.
+const TOOLS_COLLEGE = [
+  { id: "studyguide", icon: "🗂️", title: "Study Guide", desc: "Organize a chapter or lecture topic into notes, key terms, and review questions" },
+  { id: "practice", icon: "🧮", title: "Practice Problems", desc: "Practice set with worked-out solutions" },
+  { id: "flashcards", icon: "🎴", title: "Flashcards", desc: "Q&A cards for terms, formulas, or facts" },
+  { id: "exam_prep", icon: "📚", title: "Exam Prep Pack", desc: "Cumulative review across the topics you name" },
+  { id: "essay_outline", icon: "📝", title: "Essay Outline", desc: "Thesis + argument scaffolding for a paper" },
+  { id: "reading_summary", icon: "📖", title: "Reading Summary", desc: "Chapter/article summary with key ideas" },
+  { id: "lecture_notes", icon: "🎙️", title: "Lecture Notes Cleanup", desc: "Paste rough notes; get a clean organized version" },
+];
+
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 function getWeekNumber(startDate) {
   const start = new Date(startDate);
@@ -2426,6 +2520,7 @@ function AuthScreen({ onLogin, onSignup }) {
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [name, setName] = useState("");
+  const [userType, setUserType] = useState("parent"); // 'parent' | 'student'
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
 
@@ -2437,7 +2532,7 @@ function AuthScreen({ onLogin, onSignup }) {
       if (tab === "login") {
         await onLogin(email, password);
       } else {
-        await onSignup(email, password, name || email.split("@")[0]);
+        await onSignup(email, password, name || email.split("@")[0], userType);
       }
     } catch (e) {
       setError(e.message || "Something went wrong. Please try again.");
@@ -2460,14 +2555,44 @@ function AuthScreen({ onLogin, onSignup }) {
         </div>
 
         {tab === "signup" && (
-          <div className="form-group">
-            <label>Your Name</label>
-            <input placeholder="Sarah Jones" value={name} onChange={e => setName(e.target.value)} />
-          </div>
+          <>
+            <div className="form-group">
+              <label>I'm signing up as...</label>
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
+                {[
+                  { id: "parent", emoji: "👨‍👩‍👧", name: "Parent", desc: "I'm homeschooling my kids" },
+                  { id: "student", emoji: "🎓", name: "College Student", desc: "I'm managing my own courses" },
+                ].map(opt => (
+                  <button
+                    key={opt.id}
+                    type="button"
+                    onClick={() => setUserType(opt.id)}
+                    style={{
+                      textAlign: "left",
+                      padding: "12px 14px",
+                      borderRadius: 12,
+                      cursor: "pointer",
+                      background: userType === opt.id ? "var(--green-pale, #e8f5e9)" : "#fff",
+                      border: userType === opt.id ? "2px solid var(--green, #2e7d32)" : "2px solid var(--border, #e6e0d4)",
+                      transition: "all 120ms ease",
+                    }}
+                  >
+                    <div style={{ fontSize: "1.4rem", marginBottom: 2 }}>{opt.emoji}</div>
+                    <div style={{ fontWeight: 700, fontSize: "0.92rem", color: userType === opt.id ? "var(--green, #2e7d32)" : "inherit" }}>{opt.name}</div>
+                    <div style={{ fontSize: "0.76rem", color: "var(--text-muted, #8A7968)", marginTop: 2 }}>{opt.desc}</div>
+                  </button>
+                ))}
+              </div>
+            </div>
+            <div className="form-group">
+              <label>Your Name</label>
+              <input placeholder={userType === "student" ? "Alex Jones" : "Sarah Jones"} value={name} onChange={e => setName(e.target.value)} />
+            </div>
+          </>
         )}
         <div className="form-group">
           <label>Email</label>
-          <input type="email" placeholder="mom@homeschool.com" value={email} onChange={e => setEmail(e.target.value)} />
+          <input type="email" placeholder={tab === "signup" && userType === "student" ? "you@school.edu" : "mom@homeschool.com"} value={email} onChange={e => setEmail(e.target.value)} />
         </div>
         <div className="form-group">
           <label>Password</label>
@@ -2570,6 +2695,7 @@ function SetupFlow({ user, onSaveKid, onUpdateKid, onSaveSemesterPlan, onComplet
   // Step 4 — per-subject build
   const [subjectIdx, setSubjectIdx] = useState(0);
   const [curriculumName, setCurriculumName] = useState("");
+  const [curriculumUrl, setCurriculumUrl] = useState("");
   const [daysPerWeek, setDaysPerWeek] = useState(5);
   const [uploadedFile, setUploadedFile] = useState(null);
   const [generating, setGenerating] = useState(false);
@@ -2721,6 +2847,7 @@ One object per school week listed above. Use the week_start_date values exactly 
         kidId,
         subject: currentSubject,
         curriculumName,
+        curriculumUrl,
         daysPerWeek,
         totalWeeks: generatedWeeks.length,
         weeks: generatedWeeks,
@@ -2731,6 +2858,7 @@ One object per school week listed above. Use the week_start_date values exactly 
       } else {
         setSubjectIdx(nextIdx);
         setCurriculumName("");
+        setCurriculumUrl("");
         setDaysPerWeek(5);
         setUploadedFile(null);
         setGeneratedWeeks(null);
@@ -2931,6 +3059,18 @@ One object per school week listed above. Use the week_start_date values exactly 
                 <input placeholder="e.g. Berean Builders Biology" value={curriculumName} onChange={e => setCurriculumName(e.target.value)} />
               </div>
               <div className="form-group">
+                <label>Curriculum Link</label>
+                <input
+                  type="url"
+                  placeholder="e.g. https://bereanbuilders.com/product/biology"
+                  value={curriculumUrl}
+                  onChange={e => setCurriculumUrl(e.target.value)}
+                />
+                <div style={{ fontSize: "0.78rem", color: "var(--text-muted, #8A7968)", marginTop: 4 }}>
+                  Link to purchase page, publisher site, or digital resource
+                </div>
+              </div>
+              <div className="form-group">
                 <label>Days Per Week</label>
                 <select value={daysPerWeek} onChange={e => setDaysPerWeek(parseInt(e.target.value, 10))}>
                   {[1, 2, 3, 4, 5].map(n => <option key={n} value={n}>{n} {n === 1 ? "day" : "days"} / week</option>)}
@@ -3031,6 +3171,591 @@ One object per school week listed above. Use the week_start_date values exactly 
       </div>
     );
   }
+
+  return null;
+}
+
+// ─── College Setup Flow ───────────────────────────────────────────────────────
+// Multi-step onboarding for user_type='student'. Creates the "self" kids row,
+// stores term dates + break weeks on it, then adds courses (subjects rows with
+// college columns) and per-course generates a week-by-week plan from an
+// uploaded syllabus PDF or pasted syllabus text.
+const CLASS_YEARS = ["Freshman", "Sophomore", "Junior", "Senior", "5th Year+", "Graduate"];
+const COLLEGE_DAY_OPTIONS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+
+function CollegeSetupFlow({ user, onSaveSelfKid, onUpdateKid, onSaveCourse, onSaveSemesterPlan, onComplete }) {
+  const [step, setStep] = useState(1);
+
+  // Step 2 — basics
+  const [school, setSchool] = useState("");
+  const [classYear, setClassYear] = useState("");
+  const [semesterStart, setSemesterStart] = useState("");
+  const [semesterEnd, setSemesterEnd] = useState("");
+  const [breakWeekStarts, setBreakWeekStarts] = useState([]);
+  const [selfKidId, setSelfKidId] = useState(null);
+  const [savingBasics, setSavingBasics] = useState(false);
+
+  // Step 3 — add courses (drafts before persisting)
+  const emptyCourse = () => ({
+    name: "",
+    courseCode: "",
+    professor: "",
+    meetingDays: [],
+    bookTitle: "",
+    bookLink: "",
+  });
+  const [courses, setCourses] = useState([emptyCourse()]);
+  const [savingCourses, setSavingCourses] = useState(false);
+  const [savedCourseIds, setSavedCourseIds] = useState([]); // parallel to courses, filled in after save
+
+  // Step 4 — per-course syllabus + generated week plan
+  const [courseIdx, setCourseIdx] = useState(0);
+  const [syllabusMode, setSyllabusMode] = useState("upload"); // 'upload' | 'paste' | 'skip'
+  const [syllabusFile, setSyllabusFile] = useState(null);
+  const [syllabusText, setSyllabusText] = useState("");
+  const [generating, setGenerating] = useState(false);
+  const [generatedWeeks, setGeneratedWeeks] = useState(null);
+  const [genError, setGenError] = useState("");
+  const [savingPlan, setSavingPlan] = useState(false);
+
+  const allWeeks = useMemo(() => getWeeksBetween(semesterStart, semesterEnd), [semesterStart, semesterEnd]);
+  const schoolWeeks = useMemo(
+    () => allWeeks.filter(w => !breakWeekStarts.includes(toIsoDate(w.weekStart))),
+    [allWeeks, breakWeekStarts]
+  );
+
+  const currentCourse = courses[courseIdx];
+  const currentCourseId = savedCourseIds[courseIdx];
+
+  const toggleBreakWeek = (iso) => {
+    setBreakWeekStarts(prev => prev.includes(iso) ? prev.filter(x => x !== iso) : [...prev, iso]);
+  };
+
+  const toggleCourseDay = (i, day) => {
+    setCourses(prev => prev.map((c, idx) => {
+      if (idx !== i) return c;
+      const has = c.meetingDays.includes(day);
+      return { ...c, meetingDays: has ? c.meetingDays.filter(d => d !== day) : [...c.meetingDays, day] };
+    }));
+  };
+
+  const updateCourseField = (i, field, value) => {
+    setCourses(prev => prev.map((c, idx) => idx === i ? { ...c, [field]: value } : c));
+  };
+
+  const addCourseDraft = () => setCourses(prev => [...prev, emptyCourse()]);
+  const removeCourseDraft = (i) => setCourses(prev => prev.length > 1 ? prev.filter((_, idx) => idx !== i) : prev);
+
+  // ── Step 2: create self-kid + save term dates ──
+  const handleSaveBasics = async () => {
+    if (!classYear || !semesterStart || !semesterEnd || allWeeks.length === 0) return;
+    setSavingBasics(true);
+    try {
+      const id = await onSaveSelfKid({ name: user.name, classYear, school });
+      setSelfKidId(id);
+      await onUpdateKid({
+        kidId: id,
+        semesterStartDate: semesterStart,
+        semesterEndDate: semesterEnd,
+        breakWeeks: breakWeekStarts,
+      });
+      setStep(3);
+    } catch (e) {
+      console.error(e);
+      alert("Couldn't save the basics: " + (e.message || "unknown error"));
+    } finally {
+      setSavingBasics(false);
+    }
+  };
+
+  // ── Step 3: persist all courses in one go ──
+  const handleSaveCourses = async () => {
+    const cleaned = courses.filter(c => c.name.trim());
+    if (!cleaned.length) return;
+    setSavingCourses(true);
+    try {
+      const ids = [];
+      for (const c of cleaned) {
+        const id = await onSaveCourse({
+          kidId: selfKidId,
+          name: c.name,
+          courseCode: c.courseCode,
+          professor: c.professor,
+          meetingDays: c.meetingDays,
+          bookTitle: c.bookTitle,
+          bookLink: c.bookLink,
+        });
+        ids.push(id);
+      }
+      setCourses(cleaned);
+      setSavedCourseIds(ids);
+      setCourseIdx(0);
+      setStep(4);
+    } catch (e) {
+      console.error(e);
+      alert("Couldn't save courses: " + (e.message || "unknown error"));
+    } finally {
+      setSavingCourses(false);
+    }
+  };
+
+  // ── Step 4: generate week-by-week plan from syllabus ──
+  const handleGeneratePlan = async () => {
+    if (!currentCourse || schoolWeeks.length === 0) return;
+    setGenerating(true);
+    setGenError("");
+    setGeneratedWeeks(null);
+    try {
+      const weeksList = schoolWeeks
+        .map((w, i) => `Week ${i + 1}: ${toIsoDate(w.weekStart)} (${fmtMonDay(w.weekStart)} - ${fmtMonDay(w.weekEnd)})`)
+        .join("\n");
+      const firstIso = toIsoDate(schoolWeeks[0].weekStart);
+
+      const courseCtx = [
+        `Course: ${currentCourse.name}${currentCourse.courseCode ? ` (${currentCourse.courseCode})` : ""}`,
+        currentCourse.professor ? `Professor: ${currentCourse.professor}` : null,
+        currentCourse.bookTitle ? `Textbook: ${currentCourse.bookTitle}` : null,
+        currentCourse.meetingDays.length ? `Meets: ${currentCourse.meetingDays.join(", ")}` : null,
+      ].filter(Boolean).join("\n");
+
+      const pastedTextBlock = (syllabusMode === "paste" && syllabusText.trim())
+        ? `\nSYLLABUS (pasted by the student):\n"""\n${syllabusText.trim()}\n"""\n`
+        : "";
+
+      const promptText =
+`You are helping a college student turn their syllabus into a week-by-week study plan.
+
+${courseCtx}
+
+The semester's school weeks (skip breaks, one plan entry per week):
+${weeksList}
+${pastedTextBlock}
+${syllabusMode === "upload" && syllabusFile?.type === "application/pdf"
+  ? "The syllabus PDF is attached — pull weekly topics, readings, and due dates from it and align them to the school weeks above."
+  : (syllabusMode === "paste" && syllabusText.trim())
+    ? "Use the pasted syllabus above to fill in each week."
+    : "No syllabus was provided — infer a reasonable week-by-week outline for the course above."}
+
+Return ONLY a JSON array, no markdown, no preamble. Format:
+[{"week_number": 1, "week_start_date": "${firstIso}", "topic": "Short title", "description": "2-3 sentences: readings, sub-topics, assignments due"}]
+
+One object per school week listed above. Use the week_start_date values exactly as given.`;
+
+      let content;
+      if (syllabusMode === "upload" && syllabusFile?.type === "application/pdf") {
+        const b64 = await fileToBase64(syllabusFile);
+        content = [
+          { type: "document", source: { type: "base64", media_type: "application/pdf", data: b64 } },
+          { type: "text", text: promptText },
+        ];
+      } else {
+        content = promptText;
+      }
+
+      const res = await fetch("/api/generate", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ max_tokens: 4096, messages: [{ role: "user", content }] }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data?.error || "API error");
+      const text = (data.content || []).map(b => b.text || "").join("");
+      const parsed = extractJsonArray(text);
+      if (!Array.isArray(parsed) || parsed.length === 0) {
+        throw new Error("Couldn't parse the plan. Try again.");
+      }
+      setGeneratedWeeks(parsed.map((w, i) => ({
+        week_number: w.week_number ?? i + 1,
+        week_start_date: w.week_start_date || (schoolWeeks[i] ? toIsoDate(schoolWeeks[i].weekStart) : null),
+        topic: w.topic || "",
+        description: w.description || "",
+      })));
+    } catch (e) {
+      console.error(e);
+      setGenError(e.message || "Generation failed.");
+    } finally {
+      setGenerating(false);
+    }
+  };
+
+  const updateGeneratedWeek = (i, field, value) => {
+    setGeneratedWeeks(prev => prev.map((w, idx) => idx === i ? { ...w, [field]: value } : w));
+  };
+
+  const skipCurrentCourse = () => {
+    const next = courseIdx + 1;
+    if (next >= courses.length) {
+      setStep(5);
+    } else {
+      setCourseIdx(next);
+      setSyllabusMode("upload");
+      setSyllabusFile(null);
+      setSyllabusText("");
+      setGeneratedWeeks(null);
+      setGenError("");
+    }
+  };
+
+  const handleLockInPlan = async () => {
+    if (!generatedWeeks?.length) return;
+    setSavingPlan(true);
+    try {
+      await onSaveSemesterPlan({
+        kidId: selfKidId,
+        subject: currentCourse.name,
+        curriculumName: currentCourse.courseCode || currentCourse.name,
+        curriculumUrl: currentCourse.bookLink || "",
+        daysPerWeek: currentCourse.meetingDays.length || null,
+        totalWeeks: generatedWeeks.length,
+        weeks: generatedWeeks,
+      });
+      skipCurrentCourse();
+    } catch (e) {
+      console.error(e);
+      alert("Couldn't save plan: " + (e.message || "unknown error"));
+    } finally {
+      setSavingPlan(false);
+    }
+  };
+
+  const handleEnter = async () => {
+    try {
+      await onComplete({ semesterDates: { start: semesterStart, end: semesterEnd } });
+    } catch (e) {
+      console.error(e);
+      alert("Couldn't finalize: " + (e.message || "unknown error"));
+    }
+  };
+
+  // ── Render ──
+  if (step === 1) return (
+    <div className="setup-wrap">
+      <div className="setup-card">
+        <div className="setup-step">Step 1 of 5 — Welcome</div>
+        <h2>Hey {user.name.split(" ")[0]}! 🎓</h2>
+        <p className="subtitle">Let's set up your semester. We'll add your courses, pull weekly topics from your syllabi, and give you a full toolkit for study guides, practice problems, exam prep, and more.</p>
+        <button className="btn-primary" onClick={() => setStep(2)}>Let's Set Up My Semester →</button>
+      </div>
+    </div>
+  );
+
+  if (step === 2) {
+    const breakCount = breakWeekStarts.length;
+    return (
+      <div className="setup-wrap">
+        <div className="setup-card">
+          <div className="setup-step">Step 2 of 5 — Your Semester</div>
+          <h2>Tell me about your term</h2>
+          <p className="subtitle">You can change any of this later.</p>
+
+          <div className="form-group">
+            <label>School (optional)</label>
+            <input placeholder="e.g. University of Michigan" value={school} onChange={e => setSchool(e.target.value)} />
+          </div>
+
+          <div className="form-group">
+            <label>Class Year</label>
+            <select value={classYear} onChange={e => setClassYear(e.target.value)}>
+              <option value="">Select year...</option>
+              {CLASS_YEARS.map(y => <option key={y} value={y}>{y}</option>)}
+            </select>
+          </div>
+
+          <div className="date-row" style={{ marginBottom: 18 }}>
+            <div className="form-group">
+              <label>Term Start</label>
+              <input type="date" value={semesterStart} onChange={e => setSemesterStart(e.target.value)} />
+            </div>
+            <div className="form-group">
+              <label>Term End</label>
+              <input type="date" value={semesterEnd} onChange={e => setSemesterEnd(e.target.value)} />
+            </div>
+          </div>
+
+          {allWeeks.length > 0 && (
+            <div className="form-group">
+              <label>Weeks ({allWeeks.length} total{breakCount ? `, ${breakCount} break` : ""})</label>
+              <p style={{ fontSize: "0.78rem", color: "var(--text-muted, #8A7968)", marginTop: -4, marginBottom: 8 }}>
+                Mark weeks off for spring break, fall break, exam week, etc.
+              </p>
+              <div style={{ display: "flex", flexDirection: "column", gap: 8, maxHeight: 320, overflowY: "auto", border: "1px solid var(--border, #e6e0d4)", borderRadius: 10, padding: 10 }}>
+                {allWeeks.map((w, i) => {
+                  const iso = toIsoDate(w.weekStart);
+                  const isBreak = breakWeekStarts.includes(iso);
+                  return (
+                    <div key={iso} style={{
+                      display: "flex", alignItems: "center", justifyContent: "space-between",
+                      padding: "10px 12px", borderRadius: 8,
+                      background: isBreak ? "#ececec" : "var(--green-pale, #e8f5e9)",
+                      color: isBreak ? "#888" : "var(--green, #2e7d32)",
+                    }}>
+                      <div>
+                        <div style={{ fontWeight: 700, fontSize: "0.92rem" }}>
+                          Week {i + 1}: {fmtMonDay(w.weekStart)} – {fmtMonDay(w.weekEnd)}
+                        </div>
+                        {isBreak && <div style={{ fontSize: "0.78rem", marginTop: 2 }}>Off</div>}
+                      </div>
+                      <div style={{ display: "flex", gap: 4, background: "rgba(255,255,255,0.6)", borderRadius: 999, padding: 3 }}>
+                        <button type="button" onClick={() => isBreak && toggleBreakWeek(iso)}
+                          style={{ border: 0, borderRadius: 999, padding: "5px 12px", cursor: "pointer", fontSize: "0.78rem", fontWeight: 700, background: !isBreak ? "var(--green, #2e7d32)" : "transparent", color: !isBreak ? "#fff" : "#666" }}>
+                          Class
+                        </button>
+                        <button type="button" onClick={() => !isBreak && toggleBreakWeek(iso)}
+                          style={{ border: 0, borderRadius: 999, padding: "5px 12px", cursor: "pointer", fontSize: "0.78rem", fontWeight: 700, background: isBreak ? "#666" : "transparent", color: isBreak ? "#fff" : "#666" }}>
+                          Off
+                        </button>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+
+          <button className="btn-primary" onClick={handleSaveBasics}
+            disabled={savingBasics || !classYear || !semesterStart || !semesterEnd || allWeeks.length === 0}>
+            {savingBasics ? "Saving..." : "Next: Add My Courses →"}
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  if (step === 3) return (
+    <div className="setup-wrap">
+      <div className="setup-card">
+        <div className="setup-step">Step 3 of 5 — Add Your Courses</div>
+        <h2>What are you taking?</h2>
+        <p className="subtitle">Add each course. You'll upload or paste each syllabus in the next step.</p>
+
+        <div style={{ display: "flex", flexDirection: "column", gap: 14, marginBottom: 12 }}>
+          {courses.map((c, i) => (
+            <div key={i} style={{ border: "1px solid var(--border, #e6e0d4)", borderRadius: 12, padding: "14px 14px 10px" }}>
+              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 8 }}>
+                <div style={{ fontSize: "0.78rem", fontWeight: 700, color: "var(--text-muted, #8A7968)", textTransform: "uppercase", letterSpacing: "0.06em" }}>
+                  Course {i + 1}
+                </div>
+                {courses.length > 1 && (
+                  <button type="button" onClick={() => removeCourseDraft(i)}
+                    style={{ background: "transparent", border: 0, color: "#c0392b", cursor: "pointer", fontSize: "0.82rem" }}>
+                    Remove
+                  </button>
+                )}
+              </div>
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, marginBottom: 10 }}>
+                <div>
+                  <label style={{ fontSize: "0.78rem", fontWeight: 700, display: "block", marginBottom: 4 }}>Course Name</label>
+                  <input placeholder="Organic Chemistry I" value={c.name} onChange={e => updateCourseField(i, "name", e.target.value)} style={{ width: "100%" }} />
+                </div>
+                <div>
+                  <label style={{ fontSize: "0.78rem", fontWeight: 700, display: "block", marginBottom: 4 }}>Course Code</label>
+                  <input placeholder="CHEM 231" value={c.courseCode} onChange={e => updateCourseField(i, "courseCode", e.target.value)} style={{ width: "100%" }} />
+                </div>
+              </div>
+              <div style={{ marginBottom: 10 }}>
+                <label style={{ fontSize: "0.78rem", fontWeight: 700, display: "block", marginBottom: 4 }}>Professor (optional)</label>
+                <input placeholder="Dr. Klein" value={c.professor} onChange={e => updateCourseField(i, "professor", e.target.value)} style={{ width: "100%" }} />
+              </div>
+              <div style={{ marginBottom: 10 }}>
+                <label style={{ fontSize: "0.78rem", fontWeight: 700, display: "block", marginBottom: 4 }}>Meeting Days</label>
+                <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+                  {COLLEGE_DAY_OPTIONS.map(d => {
+                    const on = c.meetingDays.includes(d);
+                    return (
+                      <button key={d} type="button" onClick={() => toggleCourseDay(i, d)}
+                        style={{
+                          border: 0, cursor: "pointer",
+                          padding: "6px 12px", borderRadius: 999, fontSize: "0.78rem", fontWeight: 700,
+                          background: on ? "var(--green, #2e7d32)" : "#f2ede1",
+                          color: on ? "#fff" : "#6b6357",
+                        }}>{d}</button>
+                    );
+                  })}
+                </div>
+              </div>
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
+                <div>
+                  <label style={{ fontSize: "0.78rem", fontWeight: 700, display: "block", marginBottom: 4 }}>Textbook (optional)</label>
+                  <input placeholder="Klein Organic Chemistry, 4th ed" value={c.bookTitle} onChange={e => updateCourseField(i, "bookTitle", e.target.value)} style={{ width: "100%" }} />
+                </div>
+                <div>
+                  <label style={{ fontSize: "0.78rem", fontWeight: 700, display: "block", marginBottom: 4 }}>Textbook Link (optional)</label>
+                  <input type="url" placeholder="https://…" value={c.bookLink} onChange={e => updateCourseField(i, "bookLink", e.target.value)} style={{ width: "100%" }} />
+                </div>
+              </div>
+            </div>
+          ))}
+        </div>
+
+        <button className="add-subject-btn" onClick={addCourseDraft} style={{ marginBottom: 12 }}>+ Add Another Course</button>
+
+        <div style={{ display: "flex", gap: 12 }}>
+          <button className="btn-secondary" onClick={() => setStep(2)}>← Back</button>
+          <button className="btn-primary" style={{ flex: 1 }}
+            onClick={handleSaveCourses}
+            disabled={savingCourses || courses.every(c => !c.name.trim())}>
+            {savingCourses ? "Saving..." : "Next: Add Syllabi →"}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+
+  if (step === 4) {
+    const total = courses.length;
+    return (
+      <div className="setup-wrap">
+        <div className="setup-card">
+          <div className="setup-step">Step 4 of 5 — Syllabus ({courseIdx + 1} of {total})</div>
+          <h2>{currentCourse.name}{currentCourse.courseCode ? ` · ${currentCourse.courseCode}` : ""}</h2>
+          <p className="subtitle">{schoolWeeks.length} school weeks to plan. Upload the syllabus PDF, paste the text, or skip and I'll infer a plan.</p>
+
+          {generating ? (
+            <div style={{ padding: "32px 16px", textAlign: "center", color: "var(--green, #2e7d32)" }}>
+              <div style={{ fontSize: "1.05rem", fontWeight: 700, marginBottom: 6 }}>
+                Building your {currentCourse.name} plan...
+              </div>
+              <div style={{ fontSize: "0.86rem", color: "var(--text-muted, #888)" }}>This usually takes 10–30 seconds.</div>
+            </div>
+          ) : !generatedWeeks ? (
+            <>
+              <div className="form-group">
+                <div style={{ display: "flex", gap: 6, background: "#f2ede1", padding: 4, borderRadius: 999, width: "fit-content", marginBottom: 12 }}>
+                  {[
+                    { id: "upload", label: "📄 Upload PDF" },
+                    { id: "paste", label: "📋 Paste Text" },
+                    { id: "skip", label: "⏭️ Skip" },
+                  ].map(opt => (
+                    <button key={opt.id} type="button"
+                      onClick={() => setSyllabusMode(opt.id)}
+                      style={{
+                        border: 0, cursor: "pointer",
+                        padding: "6px 14px", borderRadius: 999, fontSize: "0.82rem", fontWeight: 700,
+                        background: syllabusMode === opt.id ? "#fff" : "transparent",
+                        color: syllabusMode === opt.id ? "var(--green, #2e7d32)" : "#6b6357",
+                        boxShadow: syllabusMode === opt.id ? "0 1px 3px rgba(0,0,0,0.08)" : "none",
+                      }}>{opt.label}</button>
+                  ))}
+                </div>
+
+                {syllabusMode === "upload" && (
+                  <>
+                    <input
+                      type="file"
+                      accept="application/pdf,.pdf"
+                      onChange={e => setSyllabusFile(e.target.files?.[0] || null)}
+                    />
+                    {syllabusFile && (
+                      <div style={{ fontSize: "0.78rem", color: "var(--text-muted, #888)", marginTop: 6 }}>
+                        📎 {syllabusFile.name}
+                      </div>
+                    )}
+                    <div style={{ fontSize: "0.78rem", color: "var(--text-muted, #8A7968)", marginTop: 6 }}>
+                      Got a Word doc? Export it as PDF, or switch to Paste Text.
+                    </div>
+                  </>
+                )}
+
+                {syllabusMode === "paste" && (
+                  <textarea
+                    rows={10}
+                    placeholder="Paste your syllabus here — schedule table, weekly topics, whatever you have."
+                    value={syllabusText}
+                    onChange={e => setSyllabusText(e.target.value)}
+                    style={{ width: "100%", fontFamily: "inherit", fontSize: "0.9rem", padding: 10, borderRadius: 8, border: "1px solid var(--border, #e6e0d4)", resize: "vertical", lineHeight: 1.4 }}
+                  />
+                )}
+
+                {syllabusMode === "skip" && (
+                  <div style={{ background: "#fdf6e3", border: "1px solid #eadfba", borderRadius: 8, padding: "10px 14px", fontSize: "0.85rem", color: "#8a7000" }}>
+                    ⚠️ Without a syllabus I'll infer a generic outline. You can edit each week after.
+                  </div>
+                )}
+              </div>
+
+              {genError && (
+                <div style={{ background: "#fde8e8", color: "#c0392b", borderRadius: 8, padding: "10px 14px", fontSize: "0.85rem", marginBottom: 16 }}>
+                  ⚠️ {genError}
+                </div>
+              )}
+
+              <div style={{ display: "flex", gap: 12 }}>
+                <button className="btn-secondary" onClick={skipCurrentCourse}>Skip This Course →</button>
+                <button className="btn-primary" style={{ flex: 1 }}
+                  onClick={handleGeneratePlan}
+                  disabled={
+                    schoolWeeks.length === 0 ||
+                    (syllabusMode === "upload" && !syllabusFile && false) // upload is optional even in upload mode; falls back to inference
+                  }>
+                  Generate Week-by-Week Plan
+                </button>
+              </div>
+            </>
+          ) : (
+            <>
+              <div style={{ display: "flex", flexDirection: "column", gap: 10, maxHeight: 460, overflowY: "auto", marginBottom: 16, border: "1px solid var(--border, #e6e0d4)", borderRadius: 10, padding: 10 }}>
+                {generatedWeeks.map((w, i) => (
+                  <div key={i} style={{ background: "#fff", border: "1px solid var(--border, #e6e0d4)", borderRadius: 10, padding: 12 }}>
+                    <div style={{ fontSize: "0.78rem", color: "var(--text-muted, #888)", fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.05em", marginBottom: 6 }}>
+                      Week {w.week_number} · {w.week_start_date}
+                    </div>
+                    <input
+                      value={w.topic}
+                      onChange={e => updateGeneratedWeek(i, "topic", e.target.value)}
+                      placeholder="Topic"
+                      style={{ width: "100%", fontSize: "1rem", fontWeight: 700, padding: "6px 8px", border: "1px solid transparent", borderRadius: 6, marginBottom: 6 }}
+                      onFocus={e => e.target.style.border = "1px solid var(--green, #2e7d32)"}
+                      onBlur={e => e.target.style.border = "1px solid transparent"}
+                    />
+                    <textarea
+                      value={w.description}
+                      onChange={e => updateGeneratedWeek(i, "description", e.target.value)}
+                      placeholder="Readings, sub-topics, assignments"
+                      rows={3}
+                      style={{ width: "100%", fontSize: "0.88rem", padding: "6px 8px", border: "1px solid transparent", borderRadius: 6, resize: "vertical", fontFamily: "inherit", lineHeight: 1.4 }}
+                      onFocus={e => e.target.style.border = "1px solid var(--green, #2e7d32)"}
+                      onBlur={e => e.target.style.border = "1px solid transparent"}
+                    />
+                  </div>
+                ))}
+              </div>
+              <div style={{ display: "flex", gap: 12 }}>
+                <button className="btn-secondary" onClick={() => { setGeneratedWeeks(null); setGenError(""); }}>
+                  Re-generate
+                </button>
+                <button
+                  className="btn-primary"
+                  style={{ flex: 1 }}
+                  onClick={handleLockInPlan}
+                  disabled={savingPlan}>
+                  {savingPlan ? "Saving..."
+                    : (courseIdx + 1 < total ? "Looks Good — Next Course →" : "Looks Good — Lock It In →")}
+                </button>
+              </div>
+            </>
+          )}
+        </div>
+      </div>
+    );
+  }
+
+  if (step === 5) return (
+    <div className="setup-wrap">
+      <div className="setup-card">
+        <div className="setup-step">Step 5 of 5 — All Set!</div>
+        <h2>Your semester is ready! 🎉</h2>
+        <p className="subtitle">HomeRoom knows your courses, your syllabi, and your break weeks. Time to make some study guides.</p>
+
+        <div style={{ background: "var(--green-pale, #e8f5e9)", borderRadius: 10, padding: "14px 18px", marginBottom: 24, color: "var(--green, #2e7d32)", lineHeight: 1.7 }}>
+          <div><strong>{schoolWeeks.length}</strong> school weeks</div>
+          <div><strong>{breakWeekStarts.length}</strong> weeks off</div>
+          <div><strong>{courses.length}</strong> course{courses.length === 1 ? "" : "s"}: {courses.map(c => c.name).join(", ")}</div>
+        </div>
+
+        <button className="btn-primary" onClick={handleEnter}>Enter HomeRoom →</button>
+      </div>
+    </div>
+  );
 
   return null;
 }
@@ -3294,9 +4019,10 @@ function AssignToPlanRow({ kidId, kidName, getEntry, onAssignToPlan, onAssigned 
   );
 }
 
-function GenerationModal({ tool, kids, onClose, onSave, onAssignToPlan }) {
+function GenerationModal({ tool, kids, onClose, onSave, onAssignToPlan, mode = "parent" }) {
+  const isCollege = mode === "student";
   const [kidId, setKidId] = useState(kids[0]?.id || "");
-  const [subject, setSubject] = useState("");
+  const [subject, setSubject] = useState(isCollege ? (kids[0]?.subjects?.[0] || "") : "");
   const [topic, setTopic] = useState("");
   const [loading, setLoading] = useState(false);
   const [output, setOutput] = useState("");
@@ -3305,6 +4031,7 @@ function GenerationModal({ tool, kids, onClose, onSave, onAssignToPlan }) {
 
   const selectedKid = kids.find(k => String(k.id) === String(kidId));
   const subjects = selectedKid?.subjects || [];
+  const courseDetail = isCollege ? (selectedKid?.subjectDetails || []).find(d => d.name === subject) : null;
 
   const generate = async () => {
     setLoading(true);
@@ -3312,7 +4039,7 @@ function GenerationModal({ tool, kids, onClose, onSave, onAssignToPlan }) {
     setSaved(false);
     setAssignedItem(null);
     const kid = selectedKid;
-    const prompt = buildPrompt(tool, kid, subject, topic);
+    const prompt = buildPrompt(tool, kid, subject, topic, { isCollege, courseDetail });
     try {
       const res = await fetch("/api/generate", {
         method: "POST",
@@ -3345,7 +4072,35 @@ function GenerationModal({ tool, kids, onClose, onSave, onAssignToPlan }) {
     setLoading(false);
   };
 
-  const buildPrompt = (tool, kid, subject, topic) => {
+  const buildPrompt = (tool, kid, subject, topic, opts = {}) => {
+    if (opts.isCollege) {
+      const cd = opts.courseDetail || {};
+      const ctxParts = [
+        `Course: ${subject}${cd.courseCode ? ` (${cd.courseCode})` : ""}`,
+        cd.professor ? `Professor: ${cd.professor}` : null,
+        cd.bookTitle ? `Textbook: ${cd.bookTitle}` : null,
+        `Topic: ${topic}`,
+      ].filter(Boolean);
+      const ctx = ctxParts.join("\n");
+      switch (tool.id) {
+        case "studyguide":
+          return `${ctx}\n\nCreate a comprehensive college-level study guide for this topic. Include: (1) a concise overview, (2) key concepts with clear definitions, (3) important vocabulary/terms, (4) worked examples where relevant, (5) common misconceptions to watch for, (6) 8-12 review questions with answers at the end. Use markdown headings.`;
+        case "practice":
+          return `${ctx}\n\nCreate a set of 8-12 college-level practice problems on this topic. For each problem, provide the full worked-out solution with steps and reasoning. Vary difficulty from warm-up to challenging. Use markdown; put "## Solutions" at the end.`;
+        case "flashcards":
+          return `${ctx}\n\nCreate 20 flashcards covering the key terms, formulas, and concepts for this topic. Format strictly as:\n\n**Q:** [question or term]\n**A:** [concise answer or definition]\n\nOne blank line between cards. No preamble.`;
+        case "exam_prep":
+          return `${ctx}\n\nCreate an exam prep pack covering the topic(s) named above. Include: (1) a one-page cheat sheet of formulas/definitions/frameworks, (2) 5-8 short-answer questions with answers, (3) 3-5 longer application/analysis questions with full model answers, (4) a "10 things you should be able to do by exam day" checklist. Use markdown headings.`;
+        case "essay_outline":
+          return `${ctx}\n\nCreate a detailed essay outline for a college paper on this topic. Include: (1) a proposed thesis statement (offer 2 alternatives), (2) intro hook and roadmap, (3) 3-5 body sections each with topic sentence, evidence/examples to gather, and counter-argument to address, (4) conclusion moves, (5) a starter list of 5-8 credible sources or search terms. Use markdown headings.`;
+        case "reading_summary":
+          return `${ctx}\n\nWrite a college-level reading summary for this reading. Include: (1) 2-3 sentence overview, (2) the main argument/thesis in one line, (3) key points as a bulleted list, (4) key terms with brief definitions, (5) 3-5 questions the reading raises or leaves open. Use markdown headings. Keep it focused — no fluff.`;
+        case "lecture_notes":
+          return `${ctx}\n\nThe topic field above contains rough lecture notes the student took. Clean them up into a well-organized set of study notes with clear markdown headings, bullet lists, defined terms, and any equations/examples formatted properly. Fix obvious typos and expand any shorthand. Do NOT invent content not implied by the notes — if something is unclear, mark it with "(unclear — verify)".`;
+        default:
+          return `${ctx}\n\nCreate a helpful college-level study material for this topic.`;
+      }
+    }
     const base = `Student: ${kid?.name}, ${kid?.grade}, learning style: ${kid?.learningStyle || "general"}. Subject: ${subject}. Topic: ${topic}.`;
     switch (tool.id) {
       case "lesson": return `${base} Create a detailed, engaging weekly lesson plan tailored to this student's learning style. Include objectives, activities, and materials needed.`;
@@ -3362,24 +4117,45 @@ function GenerationModal({ tool, kids, onClose, onSave, onAssignToPlan }) {
         <h2>{tool.icon} {tool.title}</h2>
         <p className="subtitle">{tool.desc}</p>
 
-        <div className="form-group">
-          <label>Student</label>
-          <select value={kidId} onChange={e => { setKidId(e.target.value); setSubject(""); }}>
-            {kids.map(k => <option key={k.id} value={k.id}>{k.name} — {k.grade}</option>)}
-          </select>
-        </div>
+        {!isCollege && (
+          <div className="form-group">
+            <label>Student</label>
+            <select value={kidId} onChange={e => { setKidId(e.target.value); setSubject(""); }}>
+              {kids.map(k => <option key={k.id} value={k.id}>{k.name} — {k.grade}</option>)}
+            </select>
+          </div>
+        )}
 
         <div className="form-group">
-          <label>Subject</label>
+          <label>{isCollege ? "Course" : "Subject"}</label>
           <select value={subject} onChange={e => setSubject(e.target.value)}>
-            <option value="">Select subject...</option>
+            <option value="">Select {isCollege ? "course" : "subject"}...</option>
             {subjects.map(s => <option key={s} value={s}>{s}</option>)}
           </select>
         </div>
 
         <div className="form-group">
-          <label>Topic or Chapter</label>
-          <input placeholder="e.g. Fractions — adding unlike denominators" value={topic} onChange={e => setTopic(e.target.value)} />
+          <label>{tool.id === "lecture_notes" ? "Paste your rough lecture notes" : isCollege ? "Topic, chapter, or reading" : "Topic or Chapter"}</label>
+          {tool.id === "lecture_notes" ? (
+            <textarea
+              rows={8}
+              placeholder="Paste your class notes here — abbreviations, dashes, whatever. I'll clean them up."
+              value={topic}
+              onChange={e => setTopic(e.target.value)}
+              style={{ width: "100%", fontFamily: "inherit", fontSize: "0.92rem", padding: "10px", borderRadius: 8, border: "1px solid var(--border, #e6e0d4)", resize: "vertical", lineHeight: 1.4 }}
+            />
+          ) : (
+            <input
+              placeholder={isCollege
+                ? (tool.id === "essay_outline" ? "e.g. The role of the chorus in Sophocles' Antigone"
+                  : tool.id === "reading_summary" ? "e.g. Chapter 4 — Selection & the Genetic Basis of Adaptation"
+                  : tool.id === "exam_prep" ? "e.g. Midterm — units 1-4"
+                  : "e.g. Fourier series — convergence")
+                : "e.g. Fractions — adding unlike denominators"}
+              value={topic}
+              onChange={e => setTopic(e.target.value)}
+            />
+          )}
         </div>
 
         {loading && (
@@ -4126,6 +4902,9 @@ function StudentProfileModal({
           <div className="form-group">
             <label>Grade</label>
             <select value={grade} onChange={e => setGrade(e.target.value)}>
+              {/* Preserve the current value if it isn't a K-12 grade — happens for college users
+                  whose "grade" field stores their class year + school. */}
+              {grade && !GRADE_OPTIONS.includes(grade) && <option value={grade}>{grade}</option>}
               {GRADE_OPTIONS.map(g => <option key={g} value={g}>{g}</option>)}
             </select>
           </div>
@@ -4368,17 +5147,26 @@ function buildSundayPrompt(tool, kid, subject, topic, description, carryover) {
 
 function SundayPlanningFlow({
   kid,
-  weekStartDate,
+  weekStartDate,                    // suggested default from Dashboard (today's Monday)
   onLoadScheduleRules,
   onLoadSemesterPlanWeekFor,
+  onLoadSemesterPlanWeeksForKid,    // for the Step 0 dropdown
+  onLoadLessonPlan,                 // to detect an existing plan for the selected week
   onLoadWeeklyCheckpoint,
   onSaveWeeklyCheckpoint,
   onSaveLessonPlan,
   onClose,
 }) {
-  const [step, setStep] = useState(1);
-  const [loading, setLoading] = useState(true);
+  // step 0 = pick week, 1 = carryover, 2 = preview, 3 = generate
+  const [step, setStep] = useState(0);
+  const [loading, setLoading] = useState(false);
   const [loadError, setLoadError] = useState("");
+
+  // Step 0
+  const [availableWeeks, setAvailableWeeks] = useState([]); // [{weekNumber, weekStartDate}]
+  const [availableWeeksLoading, setAvailableWeeksLoading] = useState(true);
+  const [selectedWeekStart, setSelectedWeekStart] = useState(weekStartDate || "");
+  const [existingPlanExists, setExistingPlanExists] = useState(false);
 
   // Step 1
   const [lastWeekTopics, setLastWeekTopics] = useState({});
@@ -4396,33 +5184,97 @@ function SundayPlanningFlow({
   const [done, setDone] = useState(false);
   const [genError, setGenError] = useState("");
 
-  const weekDate = useMemo(() => new Date(weekStartDate + "T00:00:00"), [weekStartDate]);
+  // Selected week derivations
+  const weekDate = useMemo(
+    () => selectedWeekStart ? new Date(selectedWeekStart + "T00:00:00") : null,
+    [selectedWeekStart]
+  );
+  // Find the prior week_number from availableWeeks (NOT calendar -7 days, so break weeks are skipped properly).
   const lastWeekIso = useMemo(() => {
-    const d = new Date(weekDate);
-    d.setDate(d.getDate() - 7);
-    return isoLocalDate(d);
-  }, [weekDate]);
-  const fridayDate = useMemo(() => addDays(weekDate, 4), [weekDate]);
-  const weekRangeStr = `${fmtMonthDay(weekDate)} – ${fmtMonthDay(fridayDate)}, ${weekDate.getFullYear()}`;
+    if (!selectedWeekStart || availableWeeks.length === 0) return null;
+    const sel = availableWeeks.find(w => w.weekStartDate === selectedWeekStart);
+    if (!sel) return null;
+    const prev = availableWeeks.find(w => w.weekNumber === (sel.weekNumber - 1));
+    return prev?.weekStartDate || null;
+  }, [selectedWeekStart, availableWeeks]);
+  const fridayDate = useMemo(() => weekDate ? addDays(weekDate, 4) : null, [weekDate]);
+  const weekRangeStr = weekDate ? `${fmtMonthDay(weekDate)} – ${fmtMonthDay(fridayDate)}, ${weekDate.getFullYear()}` : "";
+  const selectedWeekNumber = useMemo(
+    () => availableWeeks.find(w => w.weekStartDate === selectedWeekStart)?.weekNumber || null,
+    [availableWeeks, selectedWeekStart]
+  );
 
-  // Load up everything
+  // ── Load the dropdown options once on mount ──
   useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      setAvailableWeeksLoading(true);
+      try {
+        const groups = await onLoadSemesterPlanWeeksForKid({ kidId: kid.id });
+        if (cancelled) return;
+        // Merge non-break weeks across all subjects, dedupe by week_start_date
+        const byDate = {};
+        Object.values(groups || {}).forEach(g => {
+          (g.weeks || []).forEach(w => {
+            if (w.isBreak) return;
+            if (!w.weekStartDate) return;
+            if (!byDate[w.weekStartDate]) {
+              byDate[w.weekStartDate] = { weekNumber: w.weekNumber, weekStartDate: w.weekStartDate };
+            }
+          });
+        });
+        const list = Object.values(byDate).sort((a, b) => (a.weekNumber || 0) - (b.weekNumber || 0));
+        setAvailableWeeks(list);
+        // Pick a sensible default: the suggested week if it's in the list, else first.
+        if (list.length > 0) {
+          const match = list.find(w => w.weekStartDate === weekStartDate);
+          setSelectedWeekStart((match || list[0]).weekStartDate);
+        }
+      } catch (e) {
+        console.error("loadAvailableWeeks:", e);
+      } finally {
+        if (!cancelled) setAvailableWeeksLoading(false);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [kid.id]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // ── Existing-plan check fires whenever the selected week changes ──
+  useEffect(() => {
+    if (!selectedWeekStart) { setExistingPlanExists(false); return; }
+    let cancelled = false;
+    (async () => {
+      try {
+        const { planId } = await onLoadLessonPlan({ kidId: kid.id, weekStartDate: selectedWeekStart });
+        if (!cancelled) setExistingPlanExists(!!planId);
+      } catch (e) {
+        console.error("existingPlanCheck:", e);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [kid.id, selectedWeekStart]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // ── Heavy load (carryover targets, plan preview, schedule, checkpoint) — only after step 0 ──
+  useEffect(() => {
+    if (step < 1) return;
+    if (!selectedWeekStart) return;
     let cancelled = false;
     (async () => {
       setLoading(true);
       setLoadError("");
       try {
         const [last, current, schedule, checkpoint] = await Promise.all([
-          onLoadSemesterPlanWeekFor({ kidId: kid.id, weekStartDate: lastWeekIso }),
-          onLoadSemesterPlanWeekFor({ kidId: kid.id, weekStartDate }),
+          lastWeekIso
+            ? onLoadSemesterPlanWeekFor({ kidId: kid.id, weekStartDate: lastWeekIso })
+            : Promise.resolve({}),
+          onLoadSemesterPlanWeekFor({ kidId: kid.id, weekStartDate: selectedWeekStart }),
           onLoadScheduleRules(kid.id),
-          onLoadWeeklyCheckpoint({ kidId: kid.id, weekStartDate }),
+          onLoadWeeklyCheckpoint({ kidId: kid.id, weekStartDate: selectedWeekStart }),
         ]);
         if (cancelled) return;
         setLastWeekTopics(last || {});
         setThisWeekTopics(current || {});
         setSubjectDays(schedule?.subjectDays || {});
-        // If there's an existing checkpoint and it's already approved+generated, jump to a "already done" state
         if (checkpoint?.generated_at) {
           setDone(true);
           setStep(3);
@@ -4435,7 +5287,7 @@ function SundayPlanningFlow({
       }
     })();
     return () => { cancelled = true; };
-  }, [kid.id, weekStartDate, lastWeekIso]);
+  }, [step, kid.id, selectedWeekStart, lastWeekIso]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Subjects that are scheduled this week
   const subjectsThisWeek = useMemo(
@@ -4467,7 +5319,7 @@ function SundayPlanningFlow({
     try {
       await onSaveWeeklyCheckpoint({
         kidId: kid.id,
-        weekStartDate,
+        weekStartDate: selectedWeekStart,
         carryoverNotes: notes || null,
       });
       setStep(2);
@@ -4482,7 +5334,7 @@ function SundayPlanningFlow({
     try {
       await onSaveWeeklyCheckpoint({
         kidId: kid.id,
-        weekStartDate,
+        weekStartDate: selectedWeekStart,
         approvedAt: new Date().toISOString(),
       });
       setStep(3);
@@ -4561,10 +5413,10 @@ function SundayPlanningFlow({
     }
 
     try {
-      await onSaveLessonPlan({ kidId: kid.id, weekStartDate, items: collected });
+      await onSaveLessonPlan({ kidId: kid.id, weekStartDate: selectedWeekStart, items: collected });
       await onSaveWeeklyCheckpoint({
         kidId: kid.id,
-        weekStartDate,
+        weekStartDate: selectedWeekStart,
         generatedAt: new Date().toISOString(),
       });
       setSavedItemCount(collected.length);
@@ -4599,9 +5451,10 @@ function SundayPlanningFlow({
         <div style={headerStyle}>
           <div>
             <div style={{ fontSize: "0.78rem", color: "var(--text-muted, #8A7968)", fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.05em" }}>
-              Sunday Planning · {kid.name} · Week of {fmtMonthDay(weekDate)}
+              Sunday Planning · {kid.name}{step > 0 && weekDate ? ` · Week ${selectedWeekNumber || ""} (${fmtMonthDay(weekDate)})` : ""}
             </div>
             <h2 style={{ margin: "4px 0 0", fontSize: "1.4rem", color: "var(--green, #4A7C5F)" }}>
+              {step === 0 && "Select Your Planning Week"}
               {step === 1 && "Carryover Check"}
               {step === 2 && "This Week's Plan"}
               {step === 3 && (done ? "All Set!" : "Generate Materials")}
@@ -4618,6 +5471,49 @@ function SundayPlanningFlow({
           {loading && <div style={{ padding: 32, textAlign: "center", color: "var(--text-muted, #8A7968)" }}>Loading...</div>}
           {loadError && !loading && (
             <div style={{ background: "#fde8e8", color: "#c0392b", borderRadius: 8, padding: "10px 14px", fontSize: "0.85rem" }}>⚠️ {loadError}</div>
+          )}
+
+          {step === 0 && (
+            <>
+              {availableWeeksLoading ? (
+                <div style={{ padding: 24, textAlign: "center", color: "var(--text-muted, #8A7968)" }}>Loading available weeks...</div>
+              ) : availableWeeks.length === 0 ? (
+                <div style={{ padding: 16, background: "#fff8e1", color: "#7c6a00", borderRadius: 10, lineHeight: 1.5 }}>
+                  No semester plan weeks found for {kid.name}. Run the setup flow to build one first.
+                </div>
+              ) : (
+                <>
+                  <div style={{ marginBottom: 16, color: "var(--text-muted, #8A7968)", lineHeight: 1.5 }}>
+                    Pick the week you want to plan. You can plan ahead or catch up on a week you missed.
+                  </div>
+                  <div className="form-group" style={{ marginBottom: 14 }}>
+                    <label style={{ display: "block", fontSize: "0.82rem", fontWeight: 700, color: "var(--text-muted, #8A7968)", marginBottom: 6, textTransform: "uppercase", letterSpacing: "0.05em" }}>
+                      Planning Week
+                    </label>
+                    <select
+                      value={selectedWeekStart}
+                      onChange={e => setSelectedWeekStart(e.target.value)}
+                      style={{ width: "100%", padding: "10px 12px", borderRadius: 10, border: "1px solid var(--cream-dark, #F2E9DC)", fontSize: "0.95rem", background: "#fff" }}
+                    >
+                      {availableWeeks.map(w => {
+                        const start = new Date(w.weekStartDate + "T00:00:00");
+                        const end = addDays(start, 4);
+                        return (
+                          <option key={w.weekStartDate} value={w.weekStartDate}>
+                            Week {w.weekNumber} — {fmtMonthDay(start)} to {fmtMonthDay(end)}
+                          </option>
+                        );
+                      })}
+                    </select>
+                  </div>
+                  {existingPlanExists && (
+                    <div style={{ background: "#fff8e1", border: "1px solid #f0d97d", color: "#7c6a00", borderRadius: 10, padding: "12px 14px", marginBottom: 4, fontSize: "0.88rem", lineHeight: 1.5 }}>
+                      ⚠️ You already generated materials for this week. Continuing will add to or replace existing materials.
+                    </div>
+                  )}
+                </>
+              )}
+            </>
           )}
 
           {!loading && !loadError && step === 1 && (
@@ -4705,6 +5601,22 @@ function SundayPlanningFlow({
                           ))}
                         </div>
                       </div>
+                      {tdata.curriculumName && (
+                        <div style={{ fontSize: "0.78rem", color: "var(--text-muted, #8A7968)", marginBottom: 6 }}>
+                          {tdata.curriculumUrl ? (
+                            <a
+                              href={tdata.curriculumUrl}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              style={{ color: "var(--green, #4A7C5F)", textDecoration: "underline", display: "inline-flex", alignItems: "center", gap: 4 }}
+                            >
+                              {tdata.curriculumName} <span aria-hidden="true">↗</span>
+                            </a>
+                          ) : (
+                            tdata.curriculumName
+                          )}
+                        </div>
+                      )}
                       {carry && (
                         <div style={{ fontSize: "0.78rem", background: "#fff4e0", color: "#8a5a00", borderRadius: 8, padding: "6px 10px", marginBottom: 8 }}>
                           ↩️ Carryover: {carry}
@@ -4770,9 +5682,22 @@ function SundayPlanningFlow({
         </div>
 
         <div style={footerStyle}>
-          {!loading && !loadError && step === 1 && (
+          {step === 0 && (
             <>
               <button className="btn-secondary" onClick={onClose}>Cancel</button>
+              <button
+                className="btn-primary"
+                style={{ flex: 1 }}
+                onClick={() => setStep(1)}
+                disabled={availableWeeksLoading || !selectedWeekStart || availableWeeks.length === 0}
+              >
+                Plan This Week →
+              </button>
+            </>
+          )}
+          {!loading && !loadError && step === 1 && (
+            <>
+              <button className="btn-secondary" onClick={() => setStep(0)}>← Back</button>
               <button className="btn-primary" style={{ flex: 1 }} onClick={handleStep1Next}>Next →</button>
             </>
           )}
@@ -4924,7 +5849,20 @@ function SemesterPlanModal({ kid, onClose, onLoadSemesterPlanWeeksForKid, onUpda
               <div key={subject} style={{ marginBottom: 18 }}>
                 <div style={{ display: "flex", alignItems: "baseline", gap: 8, marginBottom: 8, flexWrap: "wrap" }}>
                   <h3 style={{ margin: 0, fontSize: "1.05rem", color: "var(--green, #4A7C5F)" }}>{subject}</h3>
-                  {g.curriculumName && <span style={{ fontSize: "0.78rem", color: "var(--text-muted, #8A7968)" }}>{g.curriculumName}</span>}
+                  {g.curriculumName && (
+                    g.curriculumUrl ? (
+                      <a
+                        href={g.curriculumUrl}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        style={{ fontSize: "0.78rem", color: "var(--green, #4A7C5F)", textDecoration: "underline", display: "inline-flex", alignItems: "center", gap: 4 }}
+                      >
+                        {g.curriculumName} <span aria-hidden="true">↗</span>
+                      </a>
+                    ) : (
+                      <span style={{ fontSize: "0.78rem", color: "var(--text-muted, #8A7968)" }}>{g.curriculumName}</span>
+                    )
+                  )}
                 </div>
                 {g.weeks.length === 0 && (
                   <div style={{ fontSize: "0.85rem", color: "var(--text-muted, #8A7968)" }}>No weeks saved.</div>
@@ -5294,8 +6232,14 @@ function Dashboard({
   onLoadSemesterPlanWeekFor, onLoadSemesterPlanWeeksForKid, onUpdateSemesterPlanWeek,
   onLoadWeeklyCheckpoint, onSaveWeeklyCheckpoint,
   onUpdateKid, onAddSubject, onDeleteSubject, onUpdateSubjectResources, onUploadAvatar,
-  onSignOut
+  onSignOut,
+  mode = "parent",
 }) {
+  const isCollege = mode === "student";
+  const activeTools = isCollege ? TOOLS_COLLEGE : TOOLS;
+  const learnerLabel = isCollege ? "My Profile" : "Students";
+  const learnerSingular = isCollege ? "course" : "student";
+  const addLearnerLabel = isCollege ? "+ Add Course" : "+ Add Student";
   const [activeTool, setActiveTool] = useState(null);
   const [activeTab, setActiveTab] = useState("dashboard");
   const [history, setHistory] = useState([]);
@@ -5377,12 +6321,17 @@ function Dashboard({
 
       <div className="main-content">
         <div className="nav-tabs">
-          {["dashboard", "students", "generate", "history"].map(t => (
-            <button key={t} className={`nav-tab ${activeTab === t ? "active" : ""}`}
-              onClick={() => setActiveTab(t)}>
-              {t.charAt(0).toUpperCase() + t.slice(1)}
-            </button>
-          ))}
+          {["dashboard", "students", "generate", "history"].map(t => {
+            const label = t === "students"
+              ? (isCollege ? "My Courses" : "Students")
+              : t.charAt(0).toUpperCase() + t.slice(1);
+            return (
+              <button key={t} className={`nav-tab ${activeTab === t ? "active" : ""}`}
+                onClick={() => setActiveTab(t)}>
+                {label}
+              </button>
+            );
+          })}
         </div>
 
         {activeTab === "dashboard" && (
@@ -5415,7 +6364,7 @@ function Dashboard({
                         🗓️ Sunday Planning
                       </div>
                       <div style={{ fontSize: "1.02rem", fontWeight: 700 }}>
-                        Ready to plan {kid.name}'s week?
+                        {isCollege ? "Ready to plan your week?" : `Ready to plan ${kid.name}'s week?`}
                       </div>
                     </div>
                     <button
@@ -5442,52 +6391,95 @@ function Dashboard({
             {suggestionKid && (
               <div className="suggestion-banner">
                 <div className="suggestion-text">
-                  <h3>📌 Heads up for {suggestionKid.name} this week</h3>
-                  <p>{suggestionSubject}: {suggestionTopic} — want to generate some materials?</p>
+                  <h3>📌 {isCollege ? `This week in ${suggestionSubject || "your courses"}` : `Heads up for ${suggestionKid.name} this week`}</h3>
+                  <p>{isCollege ? suggestionTopic : `${suggestionSubject}: ${suggestionTopic} — want to generate some materials?`}</p>
                 </div>
                 <div className="suggestion-actions">
-                  <button className="btn-white" onClick={() => { setActiveTool(TOOLS[1]); }}>Make Worksheet</button>
-                  <button className="btn-white-outline" onClick={() => { setActiveTool(TOOLS[2]); }}>Build a Quiz</button>
+                  {isCollege ? (
+                    <>
+                      <button className="btn-white" onClick={() => { setActiveTool(TOOLS_COLLEGE[0]); }}>Study Guide</button>
+                      <button className="btn-white-outline" onClick={() => { setActiveTool(TOOLS_COLLEGE[1]); }}>Practice Problems</button>
+                    </>
+                  ) : (
+                    <>
+                      <button className="btn-white" onClick={() => { setActiveTool(TOOLS[1]); }}>Make Worksheet</button>
+                      <button className="btn-white-outline" onClick={() => { setActiveTool(TOOLS[2]); }}>Build a Quiz</button>
+                    </>
+                  )}
                 </div>
               </div>
             )}
 
-            <p className="section-title">Your Students</p>
-            <div className="kids-row">
-              {kids.map(kid => (
-                <div className="kid-card" key={kid.id}>
-                  <div className="kid-avatar" style={{ padding: 0, overflow: "hidden" }}>
-                    {kid.avatarUrl
-                      ? <img src={kid.avatarUrl} alt={kid.name} style={{ width: "100%", height: "100%", objectFit: "cover" }} />
-                      : kid.emoji}
-                  </div>
-                  <h4>{kid.name}</h4>
-                  <div className="grade">{kid.grade} · {kid.learningStyle}</div>
-                  <div className="subject-pills">
-                    {kid.subjects.slice(0, 3).map(s => (
-                      <span className="subject-pill" key={s}>
-                        {s.split(" ").slice(0, 2).join(" ")}
-                        {kid.curriculumWeeks?.[s] && <span style={{ marginLeft: 3 }}>✓</span>}
-                      </span>
-                    ))}
-                    {kid.subjects.length > 3 && <span className="subject-pill">+{kid.subjects.length - 3}</span>}
-                  </div>
-                  {kid.curriculumWeeks && Object.keys(kid.curriculumWeeks).length > 0 && (
-                    <div style={{ marginTop: 8 }}>
-                      <span className="curriculum-badge">📅 {Object.keys(kid.curriculumWeeks).length} curriculum loaded</span>
+            {!isCollege && (
+              <>
+                <p className="section-title">Your Students</p>
+                <div className="kids-row">
+                  {kids.map(kid => (
+                    <div className="kid-card" key={kid.id}>
+                      <div className="kid-avatar" style={{ padding: 0, overflow: "hidden" }}>
+                        {kid.avatarUrl
+                          ? <img src={kid.avatarUrl} alt={kid.name} style={{ width: "100%", height: "100%", objectFit: "cover" }} />
+                          : kid.emoji}
+                      </div>
+                      <h4>{kid.name}</h4>
+                      <div className="grade">{kid.grade} · {kid.learningStyle}</div>
+                      <div className="subject-pills">
+                        {kid.subjects.slice(0, 3).map(s => (
+                          <span className="subject-pill" key={s}>
+                            {s.split(" ").slice(0, 2).join(" ")}
+                            {kid.curriculumWeeks?.[s] && <span style={{ marginLeft: 3 }}>✓</span>}
+                          </span>
+                        ))}
+                        {kid.subjects.length > 3 && <span className="subject-pill">+{kid.subjects.length - 3}</span>}
+                      </div>
+                      {kid.curriculumWeeks && Object.keys(kid.curriculumWeeks).length > 0 && (
+                        <div style={{ marginTop: 8 }}>
+                          <span className="curriculum-badge">📅 {Object.keys(kid.curriculumWeeks).length} curriculum loaded</span>
+                        </div>
+                      )}
                     </div>
-                  )}
+                  ))}
+                  <div className="add-kid-card" onClick={onAddKid}>
+                    <span style={{ fontSize: "1.5rem" }}>+</span>
+                    Add Student
+                  </div>
                 </div>
-              ))}
-              <div className="add-kid-card" onClick={onAddKid}>
-                <span style={{ fontSize: "1.5rem" }}>+</span>
-                Add Student
-              </div>
-            </div>
+              </>
+            )}
 
-            <p className="section-title">Generate Materials</p>
+            {isCollege && kids[0] && (
+              <>
+                <p className="section-title">My Courses</p>
+                <div className="kids-row">
+                  {kids[0].subjects.map(s => {
+                    const detail = kids[0].subjectDetails?.find(d => d.name === s);
+                    return (
+                      <div className="kid-card" key={s}>
+                        <div className="kid-avatar" style={{ padding: 0, fontSize: "1.6rem" }}>📚</div>
+                        <h4>{s}</h4>
+                        <div className="grade">
+                          {detail?.courseCode || ""}{detail?.professor ? ` · ${detail.professor}` : ""}
+                        </div>
+                        {detail?.meetingDays?.length ? (
+                          <div className="subject-pills">
+                            {detail.meetingDays.map(d => <span className="subject-pill" key={d}>{d}</span>)}
+                          </div>
+                        ) : null}
+                        {kids[0].curriculumWeeks?.[s] && (
+                          <div style={{ marginTop: 8 }}>
+                            <span className="curriculum-badge">📅 syllabus loaded</span>
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+              </>
+            )}
+
+            <p className="section-title">{isCollege ? "Study Tools" : "Generate Materials"}</p>
             <div className="tools-grid">
-              {TOOLS.map(t => (
+              {activeTools.map(t => (
                 <div className="tool-card" key={t.id} onClick={() => setActiveTool(t)}>
                   <div className="tool-icon">{t.icon}</div>
                   <h4>{t.title}</h4>
@@ -5500,30 +6492,36 @@ function Dashboard({
 
         {activeTab === "students" && (
           <>
-            <div className="student-subnav">
-              {kids.map(k => (
-                <button
-                  key={k.id}
-                  className={`student-pill ${k.id === studentViewKidId ? "active" : ""}`}
-                  onClick={() => { setStudentViewKidId(k.id); setStudentViewWeekStart(null); }}
-                >
-                  <div className="student-pill-avatar">
-                    {k.avatarUrl
-                      ? <img src={k.avatarUrl} alt={k.name} />
-                      : <span>{k.emoji}</span>}
-                  </div>
-                  <span>{k.name}</span>
-                </button>
-              ))}
-              <button className="student-pill add" onClick={onAddKid}>+ Add Student</button>
-            </div>
+            {!isCollege && (
+              <div className="student-subnav">
+                {kids.map(k => (
+                  <button
+                    key={k.id}
+                    className={`student-pill ${k.id === studentViewKidId ? "active" : ""}`}
+                    onClick={() => { setStudentViewKidId(k.id); setStudentViewWeekStart(null); }}
+                  >
+                    <div className="student-pill-avatar">
+                      {k.avatarUrl
+                        ? <img src={k.avatarUrl} alt={k.name} />
+                        : <span>{k.emoji}</span>}
+                    </div>
+                    <span>{k.name}</span>
+                  </button>
+                ))}
+                <button className="student-pill add" onClick={onAddKid}>+ Add Student</button>
+              </div>
+            )}
 
             {studentViewKid ? (
               <>
                 <div className="student-page-header" style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12, flexWrap: "wrap" }}>
                   <div>
-                    <h2>{studentViewKid.name}</h2>
-                    <div className="student-page-sub">{studentViewKid.grade}{studentViewKid.learningStyle ? ` · ${studentViewKid.learningStyle} learner` : ""}</div>
+                    <h2>{isCollege ? "My Courses" : studentViewKid.name}</h2>
+                    <div className="student-page-sub">
+                      {isCollege
+                        ? studentViewKid.grade
+                        : `${studentViewKid.grade}${studentViewKid.learningStyle ? ` · ${studentViewKid.learningStyle} learner` : ""}`}
+                    </div>
                   </div>
                   <button
                     className="btn-secondary"
@@ -5562,10 +6560,12 @@ function Dashboard({
             ) : (
               <div className="empty-state">
                 <div className="empty-icon">👋</div>
-                <h3>No students yet</h3>
-                <p>Add a student to get started.</p>
-                <button className="btn-primary" style={{ width: "auto", marginTop: 16, padding: "10px 24px" }}
-                  onClick={onAddKid}>+ Add Student</button>
+                <h3>{isCollege ? "No profile yet" : "No students yet"}</h3>
+                <p>{isCollege ? "Something went wrong loading your profile." : "Add a student to get started."}</p>
+                {!isCollege && (
+                  <button className="btn-primary" style={{ width: "auto", marginTop: 16, padding: "10px 24px" }}
+                    onClick={onAddKid}>+ Add Student</button>
+                )}
               </div>
             )}
           </>
@@ -5573,9 +6573,9 @@ function Dashboard({
 
         {activeTab === "generate" && (
           <>
-            <div className="greeting"><h2>Generate Materials</h2><p>Pick a tool to get started.</p></div>
+            <div className="greeting"><h2>{isCollege ? "Study Tools" : "Generate Materials"}</h2><p>Pick a tool to get started.</p></div>
             <div className="tools-grid">
-              {TOOLS.map(t => (
+              {activeTools.map(t => (
                 <div className="tool-card" key={t.id} onClick={() => setActiveTool(t)}>
                   <div className="tool-icon">{t.icon}</div>
                   <h4>{t.title}</h4>
@@ -5587,13 +6587,15 @@ function Dashboard({
         )}
 
         {activeTab === "history" && (() => {
-          const TOOL_FILTERS = [
-            { id: "all", label: "All" },
-            { id: "lesson", label: "📋 Lesson Plans" },
-            { id: "worksheet", label: "✏️ Worksheets" },
-            { id: "quiz", label: "🎯 Quizzes" },
-            { id: "studyguide", label: "🗂️ Study Guides" },
-          ];
+          const TOOL_FILTERS = isCollege
+            ? [{ id: "all", label: "All" }, ...TOOLS_COLLEGE.map(t => ({ id: t.id, label: `${t.icon} ${t.title}` }))]
+            : [
+                { id: "all", label: "All" },
+                { id: "lesson", label: "📋 Lesson Plans" },
+                { id: "worksheet", label: "✏️ Worksheets" },
+                { id: "quiz", label: "🎯 Quizzes" },
+                { id: "studyguide", label: "🗂️ Study Guides" },
+              ];
           const filtered = historyFilter === "all" ? history : history.filter(h => h.toolId === historyFilter);
 
           const grouped = filtered.reduce((acc, item) => {
@@ -5728,6 +6730,7 @@ function Dashboard({
           onClose={() => setActiveTool(null)}
           onSave={handleSaveToHistory}
           onAssignToPlan={onAssignGenerationToPlan}
+          mode={mode}
         />
       ) : null}
 
@@ -5759,6 +6762,8 @@ function Dashboard({
           weekStartDate={thisMondayIso}
           onLoadScheduleRules={onLoadScheduleRules}
           onLoadSemesterPlanWeekFor={onLoadSemesterPlanWeekFor}
+          onLoadSemesterPlanWeeksForKid={onLoadSemesterPlanWeeksForKid}
+          onLoadLessonPlan={onLoadLessonPlan}
           onLoadWeeklyCheckpoint={onLoadWeeklyCheckpoint}
           onSaveWeeklyCheckpoint={onSaveWeeklyCheckpoint}
           onSaveLessonPlan={onSaveLessonPlan}
@@ -5932,8 +6937,10 @@ export default function HomeRoom() {
 
   const { user, loading: authLoading, signIn, signUp, signOut } = useAuth();
   const {
+    userType,
     kids, semester, history, lessonPlans, dataLoading, setupDone,
-    saveKid, saveSemester, saveCurriculumWeeks, saveSemesterPlan,
+    saveKid, saveSelfKid, saveCourse, updateCourse,
+    saveSemester, saveCurriculumWeeks, saveSemesterPlan,
     loadSemesterPlanWeekFor, loadSemesterPlanWeeksForKid, updateSemesterPlanWeek,
     loadWeeklyCheckpoint, saveWeeklyCheckpoint,
     saveGeneration, deleteGeneration,
@@ -5964,13 +6971,24 @@ export default function HomeRoom() {
   if (!setupDone) return (
     <>
       <style>{styles}</style>
-      <SetupFlow
-        user={user}
-        onSaveKid={saveKid}
-        onUpdateKid={updateKid}
-        onSaveSemesterPlan={saveSemesterPlan}
-        onComplete={completeSetup}
-      />
+      {userType === "student" ? (
+        <CollegeSetupFlow
+          user={user}
+          onSaveSelfKid={saveSelfKid}
+          onUpdateKid={updateKid}
+          onSaveCourse={saveCourse}
+          onSaveSemesterPlan={saveSemesterPlan}
+          onComplete={completeSetup}
+        />
+      ) : (
+        <SetupFlow
+          user={user}
+          onSaveKid={saveKid}
+          onUpdateKid={updateKid}
+          onSaveSemesterPlan={saveSemesterPlan}
+          onComplete={completeSetup}
+        />
+      )}
     </>
   );
 
@@ -6004,6 +7022,7 @@ export default function HomeRoom() {
         onUploadAvatar={uploadKidAvatar}
         onSignOut={signOut}
         onAddKid={saveKid}
+        mode={userType}
       />
     </>
   );
