@@ -49,7 +49,14 @@ function useAuth() {
 }
 
 function formatUser(u) {
-  return { id: u.id, email: u.email, name: u.user_metadata?.name || u.email.split("@")[0] };
+  return {
+    id: u.id,
+    email: u.email,
+    name: u.user_metadata?.name || u.email.split("@")[0],
+    // Fallback for user_type — used when the profiles.user_type column doesn't exist yet
+    // (i.e. the college-mode migration hasn't been run on this Supabase project).
+    userType: u.user_metadata?.user_type || null,
+  };
 }
 
 // ─── useHomeRoom Hook ─────────────────────────────────────────────────────────
@@ -169,8 +176,10 @@ function useHomeRoom(userId) {
   };
 
   // College-mode: insert a course as a subjects row with the extra college fields.
+  // Falls back to a name-only insert if the college-mode migration hasn't been
+  // run yet (i.e. course_code/professor/etc. columns don't exist).
   const saveCourse = async ({ kidId, name, courseCode, professor, meetingDays, bookTitle, bookLink, syllabusUrl, syllabusText }) => {
-    const { data, error } = await supabase.from("subjects").insert({
+    const full = {
       kid_id: kidId,
       name: name.trim(),
       course_code: courseCode?.trim() || null,
@@ -180,7 +189,14 @@ function useHomeRoom(userId) {
       book_link: bookLink?.trim() || null,
       syllabus_url: syllabusUrl?.trim() || null,
       syllabus_text: syllabusText?.trim() || null,
-    }).select().single();
+    };
+    let { data, error } = await supabase.from("subjects").insert(full).select().single();
+    if (error && /column .* does not exist/i.test(error.message || "")) {
+      // Retry with legacy columns only (name + book_title/book_link, which existed pre-migration).
+      const legacy = { kid_id: kidId, name: full.name, book_title: full.book_title, book_link: full.book_link };
+      ({ data, error } = await supabase.from("subjects").insert(legacy).select().single());
+      if (!error) console.warn("saveCourse: college-mode migration not run yet; extra course fields dropped");
+    }
     if (error) throw error;
     await loadKids();
     return data.id;
@@ -632,6 +648,40 @@ function useHomeRoom(userId) {
     setSetupDone(true);
   };
 
+  // "Start next semester" for college users: deactivate the active semesters
+  // row, clear the self-kid's term dates + break weeks, and re-route the app
+  // back through CollegeSetupFlow. Existing courses are preserved — the user
+  // can delete them from the Semester page beforehand for a clean slate.
+  const startNewSemester = async () => {
+    await supabase.from("semesters").update({ is_active: false }).eq("user_id", userId).eq("is_active", true);
+    const selfKid = kids[0];
+    if (selfKid) {
+      await supabase.from("kids").update({
+        semester_start_date: null,
+        semester_end_date: null,
+        break_weeks: null,
+      }).eq("id", selfKid.id);
+    }
+    setSemester(null);
+    setSetupDone(false);
+    await loadAll();
+  };
+
+  // College-mode: overwrite only the term dates + break weeks on the self-kid
+  // and refresh the active semesters row. Used by the Semester tab's
+  // "Change term dates" modal.
+  const updateSemesterDates = async ({ start, end, breakWeeks }) => {
+    const selfKid = kids[0];
+    if (!selfKid) throw new Error("No self-kid found");
+    await supabase.from("kids").update({
+      semester_start_date: start,
+      semester_end_date: end,
+      break_weeks: breakWeeks || null,
+    }).eq("id", selfKid.id);
+    await saveSemester({ start, end });
+    await loadKids();
+  };
+
   return {
     userType,
     kids, semester, history, lessonPlans, dataLoading, setupDone,
@@ -644,7 +694,8 @@ function useHomeRoom(userId) {
     loadLessonPlan, saveLessonPlan, assignLessonPlanItem,
     assignGenerationToPlan,
     updateKid, addSubjectToKid, deleteSubject, updateSubjectResources, uploadKidAvatar,
-    completeSetup, reload: loadAll
+    completeSetup, startNewSemester, updateSemesterDates,
+    reload: loadAll
   };
 }
 
@@ -3183,16 +3234,28 @@ One object per school week listed above. Use the week_start_date values exactly 
 const CLASS_YEARS = ["Freshman", "Sophomore", "Junior", "Senior", "5th Year+", "Graduate"];
 const COLLEGE_DAY_OPTIONS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
 
-function CollegeSetupFlow({ user, onSaveSelfKid, onUpdateKid, onSaveCourse, onSaveSemesterPlan, onComplete }) {
-  const [step, setStep] = useState(1);
+// `as="modal"` renders the flow inside an overlay instead of a full-page wrap
+// and skips Step 1 (welcome). `initial` pre-fills school/classYear and
+// bypasses saveSelfKid when kidId is supplied — used by the "start a new
+// semester" button so we reuse the existing self-kid row and only update
+// dates + add new courses on top.
+function CollegeSetupFlow({
+  user,
+  onSaveSelfKid, onUpdateKid, onSaveCourse, onSaveSemesterPlan, onComplete,
+  as = "wizard",
+  initial = {},
+  onCancel,
+}) {
+  const isModal = as === "modal";
+  const [step, setStep] = useState(isModal ? 2 : 1);
 
   // Step 2 — basics
-  const [school, setSchool] = useState("");
-  const [classYear, setClassYear] = useState("");
+  const [school, setSchool] = useState(initial.school || "");
+  const [classYear, setClassYear] = useState(initial.classYear || "");
   const [semesterStart, setSemesterStart] = useState("");
   const [semesterEnd, setSemesterEnd] = useState("");
   const [breakWeekStarts, setBreakWeekStarts] = useState([]);
-  const [selfKidId, setSelfKidId] = useState(null);
+  const [selfKidId, setSelfKidId] = useState(initial.kidId || null);
   const [savingBasics, setSavingBasics] = useState(false);
 
   // Step 3 — add courses (drafts before persisting)
@@ -3246,18 +3309,22 @@ function CollegeSetupFlow({ user, onSaveSelfKid, onUpdateKid, onSaveCourse, onSa
   const addCourseDraft = () => setCourses(prev => [...prev, emptyCourse()]);
   const removeCourseDraft = (i) => setCourses(prev => prev.length > 1 ? prev.filter((_, idx) => idx !== i) : prev);
 
-  // ── Step 2: create self-kid + save term dates ──
+  // ── Step 2: create self-kid (if new) + save term dates ──
   const handleSaveBasics = async () => {
     if (!classYear || !semesterStart || !semesterEnd || allWeeks.length === 0) return;
     setSavingBasics(true);
     try {
-      const id = await onSaveSelfKid({ name: user.name, classYear, school });
+      // Reuse the existing self-kid if this is a re-run (start-a-new-semester flow).
+      const id = selfKidId || await onSaveSelfKid({ name: user.name, classYear, school });
       setSelfKidId(id);
       await onUpdateKid({
         kidId: id,
         semesterStartDate: semesterStart,
         semesterEndDate: semesterEnd,
         breakWeeks: breakWeekStarts,
+        // Only re-write grade when this is initial setup — never overwrite a
+        // grade the user may have edited after onboarding.
+        ...(initial.kidId ? {} : { grade: [classYear, school].filter(Boolean).join(" · ") || "College" }),
       });
       setStep(3);
     } catch (e) {
@@ -3758,6 +3825,322 @@ One object per school week listed above. Use the week_start_date values exactly 
   );
 
   return null;
+}
+
+// ─── Add-Course Modal ────────────────────────────────────────────────────────
+// Small single-course form used from the Semester tab. Same field set as
+// CollegeSetupFlow's step 3 rows but persists one course at a time and
+// closes on save. Does NOT walk through syllabus / weekly-plan generation —
+// that stays in the setup wizard.
+function AddCourseModal({ kidId, onClose, onSave }) {
+  const [name, setName] = useState("");
+  const [courseCode, setCourseCode] = useState("");
+  const [professor, setProfessor] = useState("");
+  const [meetingDays, setMeetingDays] = useState([]);
+  const [bookTitle, setBookTitle] = useState("");
+  const [bookLink, setBookLink] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
+
+  const toggleDay = (d) => setMeetingDays(prev => prev.includes(d) ? prev.filter(x => x !== d) : [...prev, d]);
+
+  const handleSave = async () => {
+    if (!name.trim()) return;
+    setSaving(true);
+    setError("");
+    try {
+      await onSave({ kidId, name, courseCode, professor, meetingDays, bookTitle, bookLink });
+      onClose();
+    } catch (e) {
+      console.error(e);
+      setError(e.message || "Couldn't save the course.");
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <div className="modal-overlay" onClick={e => e.target === e.currentTarget && onClose()}>
+      <div className="modal" style={{ maxWidth: 540 }}>
+        <h2>➕ Add a Course</h2>
+        <p className="subtitle">You can upload the syllabus later from the course card.</p>
+
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, marginBottom: 10 }}>
+          <div className="form-group" style={{ marginBottom: 0 }}>
+            <label>Course Name</label>
+            <input placeholder="Organic Chemistry I" value={name} onChange={e => setName(e.target.value)} />
+          </div>
+          <div className="form-group" style={{ marginBottom: 0 }}>
+            <label>Course Code</label>
+            <input placeholder="CHEM 231" value={courseCode} onChange={e => setCourseCode(e.target.value)} />
+          </div>
+        </div>
+        <div className="form-group">
+          <label>Professor (optional)</label>
+          <input placeholder="Dr. Klein" value={professor} onChange={e => setProfessor(e.target.value)} />
+        </div>
+        <div className="form-group">
+          <label>Meeting Days</label>
+          <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+            {COLLEGE_DAY_OPTIONS.map(d => {
+              const on = meetingDays.includes(d);
+              return (
+                <button key={d} type="button" onClick={() => toggleDay(d)}
+                  style={{
+                    border: 0, cursor: "pointer",
+                    padding: "6px 12px", borderRadius: 999, fontSize: "0.78rem", fontWeight: 700,
+                    background: on ? "var(--green, #2e7d32)" : "#f2ede1",
+                    color: on ? "#fff" : "#6b6357",
+                  }}>{d}</button>
+              );
+            })}
+          </div>
+        </div>
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
+          <div className="form-group">
+            <label>Textbook (optional)</label>
+            <input placeholder="Klein Organic Chemistry, 4th ed" value={bookTitle} onChange={e => setBookTitle(e.target.value)} />
+          </div>
+          <div className="form-group">
+            <label>Textbook Link (optional)</label>
+            <input type="url" placeholder="https://…" value={bookLink} onChange={e => setBookLink(e.target.value)} />
+          </div>
+        </div>
+
+        {error && (
+          <div style={{ background: "#fde8e8", color: "#c0392b", borderRadius: 8, padding: "10px 14px", fontSize: "0.85rem", marginBottom: 12 }}>
+            ⚠️ {error}
+          </div>
+        )}
+
+        <div className="modal-footer">
+          <button className="btn-secondary" onClick={onClose} disabled={saving}>Cancel</button>
+          <button className="btn-primary" style={{ width: "auto", padding: "10px 24px" }}
+            onClick={handleSave} disabled={saving || !name.trim()}>
+            {saving ? "Saving..." : "Add Course"}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── Edit Term Dates Modal ───────────────────────────────────────────────────
+// Small modal that updates the semester's start/end + break weeks in-place
+// without going through the full CollegeSetupFlow.
+function EditTermDatesModal({ initialStart, initialEnd, initialBreakWeeks, onClose, onSave }) {
+  const [start, setStart] = useState(initialStart || "");
+  const [end, setEnd] = useState(initialEnd || "");
+  const [breakWeekStarts, setBreakWeekStarts] = useState(initialBreakWeeks || []);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
+
+  const weeks = useMemo(() => getWeeksBetween(start, end), [start, end]);
+  const toggleBreak = (iso) =>
+    setBreakWeekStarts(prev => prev.includes(iso) ? prev.filter(x => x !== iso) : [...prev, iso]);
+
+  const handleSave = async () => {
+    if (!start || !end || weeks.length === 0) return;
+    setSaving(true);
+    setError("");
+    try {
+      await onSave({ start, end, breakWeeks: breakWeekStarts });
+      onClose();
+    } catch (e) {
+      console.error(e);
+      setError(e.message || "Couldn't save.");
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <div className="modal-overlay" onClick={e => e.target === e.currentTarget && onClose()}>
+      <div className="modal" style={{ maxWidth: 540 }}>
+        <h2>📅 Term Dates & Break Weeks</h2>
+        <p className="subtitle">Update your semester without starting over.</p>
+
+        <div className="date-row" style={{ marginBottom: 18 }}>
+          <div className="form-group">
+            <label>Term Start</label>
+            <input type="date" value={start} onChange={e => setStart(e.target.value)} />
+          </div>
+          <div className="form-group">
+            <label>Term End</label>
+            <input type="date" value={end} onChange={e => setEnd(e.target.value)} />
+          </div>
+        </div>
+
+        {weeks.length > 0 && (
+          <div className="form-group">
+            <label>Weeks ({weeks.length} total{breakWeekStarts.length ? `, ${breakWeekStarts.length} off` : ""})</label>
+            <div style={{ display: "flex", flexDirection: "column", gap: 6, maxHeight: 260, overflowY: "auto", border: "1px solid var(--border, #e6e0d4)", borderRadius: 10, padding: 8 }}>
+              {weeks.map((w, i) => {
+                const iso = toIsoDate(w.weekStart);
+                const off = breakWeekStarts.includes(iso);
+                return (
+                  <button key={iso} type="button" onClick={() => toggleBreak(iso)}
+                    style={{
+                      display: "flex", alignItems: "center", justifyContent: "space-between",
+                      padding: "8px 10px", borderRadius: 8, border: 0, cursor: "pointer",
+                      background: off ? "#ececec" : "var(--green-pale, #e8f5e9)",
+                      color: off ? "#888" : "var(--green, #2e7d32)",
+                      fontWeight: 700, fontSize: "0.86rem",
+                    }}>
+                    <span>Week {i + 1}: {fmtMonDay(w.weekStart)} – {fmtMonDay(w.weekEnd)}</span>
+                    <span style={{ fontSize: "0.76rem" }}>{off ? "Off" : "Class"}</span>
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+        )}
+
+        {error && (
+          <div style={{ background: "#fde8e8", color: "#c0392b", borderRadius: 8, padding: "10px 14px", fontSize: "0.85rem", marginBottom: 12 }}>
+            ⚠️ {error}
+          </div>
+        )}
+
+        <div className="modal-footer">
+          <button className="btn-secondary" onClick={onClose} disabled={saving}>Cancel</button>
+          <button className="btn-primary" style={{ width: "auto", padding: "10px 24px" }}
+            onClick={handleSave} disabled={saving || !start || !end || weeks.length === 0}>
+            {saving ? "Saving..." : "Save Dates"}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── Semester Overview Page (college tab body) ───────────────────────────────
+// Rendered inline inside the Dashboard's "Semester" tab for college users.
+// Shows term info, the course list with delete + syllabus-launch, an
+// Add Course button, and a Start Fresh Semester escape hatch.
+function SemesterOverviewPage({
+  kid, semester,
+  onEditTermDates, onAddCourse, onDeleteSubject, onLaunchCurriculumUpload,
+  onStartNewSemester,
+}) {
+  const dateFmt = s => s ? new Date(s + "T00:00:00").toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" }) : "—";
+  const today = new Date().toISOString().slice(0, 10);
+  const expired = semester?.end && semester.end < today;
+  const missing = !semester?.start || !semester?.end;
+  const status = missing ? "not-set" : expired ? "ended" : "active";
+
+  const [confirmingReset, setConfirmingReset] = useState(false);
+
+  return (
+    <div className="page-section">
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12, flexWrap: "wrap", marginBottom: 14 }}>
+        <div>
+          <h2 style={{ margin: 0, color: "var(--green, #4A7C5F)" }}>Your Semester</h2>
+          <div style={{ fontSize: "0.86rem", color: "var(--text-muted, #8A7968)", marginTop: 4 }}>
+            {kid?.grade || "—"}
+          </div>
+        </div>
+        <div style={{
+          fontSize: "0.72rem", fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.06em",
+          padding: "5px 10px", borderRadius: 999,
+          background: status === "active" ? "var(--green-pale, #e8f5e9)" : status === "ended" ? "#fdf6e3" : "#fde8e8",
+          color: status === "active" ? "var(--green, #2e7d32)" : status === "ended" ? "#8a7000" : "#c0392b",
+        }}>
+          {status === "active" ? "● Active" : status === "ended" ? "Term ended" : "Not set up"}
+        </div>
+      </div>
+
+      {/* Term dates card */}
+      <div style={{ background: "#fff", border: "1px solid var(--border, #e6e0d4)", borderRadius: 12, padding: "14px 16px", marginBottom: 12, display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12, flexWrap: "wrap" }}>
+        <div>
+          <div style={{ fontSize: "0.72rem", fontWeight: 700, color: "var(--text-muted, #8A7968)", textTransform: "uppercase", letterSpacing: "0.06em" }}>Term Dates</div>
+          <div style={{ fontSize: "0.98rem", fontWeight: 700, marginTop: 4 }}>
+            {dateFmt(semester?.start)} → {dateFmt(semester?.end)}
+          </div>
+          {kid?.breakWeeks?.length ? (
+            <div style={{ fontSize: "0.82rem", color: "var(--text-muted, #8A7968)", marginTop: 2 }}>
+              {kid.breakWeeks.length} week{kid.breakWeeks.length === 1 ? "" : "s"} off
+            </div>
+          ) : null}
+        </div>
+        <button className="btn-secondary" style={{ width: "auto", padding: "8px 16px" }} onClick={onEditTermDates}>
+          ✏️ Change dates
+        </button>
+      </div>
+
+      {/* Courses */}
+      <div style={{ marginBottom: 12 }}>
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 8 }}>
+          <div style={{ fontSize: "0.72rem", fontWeight: 700, color: "var(--text-muted, #8A7968)", textTransform: "uppercase", letterSpacing: "0.06em" }}>
+            Courses ({kid?.subjectDetails?.length || 0})
+          </div>
+          <button className="btn-secondary" style={{ width: "auto", padding: "6px 14px", fontSize: "0.82rem" }} onClick={onAddCourse}>+ Add Course</button>
+        </div>
+        {(kid?.subjectDetails || []).length === 0 && (
+          <div style={{ background: "var(--green-pale, #e8f5e9)", color: "var(--green, #2e7d32)", padding: "12px 14px", borderRadius: 10, fontSize: "0.86rem" }}>
+            No courses yet — add one above.
+          </div>
+        )}
+        <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+          {(kid?.subjectDetails || []).map(s => (
+            <div key={s.id} style={{ background: "#fff", border: "1px solid var(--border, #e6e0d4)", borderRadius: 12, padding: "12px 14px" }}>
+              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8, marginBottom: 4, flexWrap: "wrap" }}>
+                <div style={{ fontWeight: 700, fontSize: "1rem" }}>
+                  {s.name}{s.courseCode ? <span style={{ color: "var(--text-muted, #8A7968)", fontWeight: 600, marginLeft: 6, fontSize: "0.9rem" }}>· {s.courseCode}</span> : null}
+                </div>
+                <div style={{ display: "flex", gap: 6 }}>
+                  <button className="btn-ghost" style={{ padding: "4px 10px", fontSize: "0.78rem" }}
+                    onClick={() => onLaunchCurriculumUpload({ kidId: kid.id, subject: s.name })}>
+                    {s.weekCount > 0 ? "📅 Replace syllabus" : "📅 Upload syllabus"}
+                  </button>
+                  <button className="rule-delete" title="Delete course"
+                    onClick={() => {
+                      if (window.confirm(`Delete "${s.name}"? Its curriculum weeks will also be removed.`)) onDeleteSubject(s.id);
+                    }}>×</button>
+                </div>
+              </div>
+              <div style={{ fontSize: "0.82rem", color: "var(--text-muted, #8A7968)" }}>
+                {[
+                  s.professor,
+                  s.meetingDays?.length ? s.meetingDays.join(", ") : null,
+                  s.bookTitle,
+                ].filter(Boolean).join(" · ") || <em>No details</em>}
+              </div>
+              {s.weekCount > 0 && (
+                <div style={{ marginTop: 6 }}>
+                  <span className="curriculum-badge">📅 {s.weekCount} week{s.weekCount === 1 ? "" : "s"} planned</span>
+                </div>
+              )}
+              {s.bookLink && (
+                <div style={{ marginTop: 6, fontSize: "0.78rem" }}>
+                  <a href={s.bookLink} target="_blank" rel="noopener noreferrer" style={{ color: "var(--green, #2e7d32)" }}>Textbook link ↗</a>
+                </div>
+              )}
+            </div>
+          ))}
+        </div>
+      </div>
+
+      {/* Start Fresh Semester */}
+      <div style={{ marginTop: 24, padding: "14px 16px", background: "#fdf6e3", border: "1px solid #eadfba", borderRadius: 12 }}>
+        <div style={{ fontSize: "0.92rem", fontWeight: 700, marginBottom: 4 }}>🔄 Start a new semester</div>
+        <div style={{ fontSize: "0.82rem", color: "#7a6a3a", marginBottom: 10, lineHeight: 1.5 }}>
+          Clears your current term dates and re-runs the setup wizard. Existing courses stay unless you delete them above first.
+        </div>
+        {!confirmingReset ? (
+          <button className="btn-secondary" style={{ width: "auto", padding: "8px 16px", fontSize: "0.85rem" }}
+            onClick={() => setConfirmingReset(true)}>Start next semester setup →</button>
+        ) : (
+          <div style={{ display: "flex", gap: 8 }}>
+            <button className="btn-secondary" style={{ width: "auto", padding: "8px 16px", fontSize: "0.85rem" }}
+              onClick={() => setConfirmingReset(false)}>Cancel</button>
+            <button className="btn-primary" style={{ width: "auto", padding: "8px 16px", fontSize: "0.85rem" }}
+              onClick={onStartNewSemester}>Yes, re-run setup</button>
+          </div>
+        )}
+      </div>
+    </div>
+  );
 }
 
 // ─── Generation Modal ─────────────────────────────────────────────────────────
@@ -6234,12 +6617,23 @@ function Dashboard({
   onUpdateKid, onAddSubject, onDeleteSubject, onUpdateSubjectResources, onUploadAvatar,
   onSignOut,
   mode = "parent",
+  onSaveSelfKid, onSaveCourse, onUpdateCourse,
+  onStartNewSemester, onUpdateSemesterDates,
 }) {
   const isCollege = mode === "student";
   const activeTools = isCollege ? TOOLS_COLLEGE : TOOLS;
   const learnerLabel = isCollege ? "My Profile" : "Students";
   const learnerSingular = isCollege ? "course" : "student";
   const addLearnerLabel = isCollege ? "+ Add Course" : "+ Add Student";
+
+  // College-mode: is the semester missing or past its end date? Drives the
+  // banner on the Dashboard tab and the empty-state on the Semester tab.
+  const todayIso = new Date().toISOString().slice(0, 10);
+  const semesterNeedsSetup = isCollege && (
+    !semesterDates?.start || !semesterDates?.end || (semesterDates.end && semesterDates.end < todayIso)
+  );
+  const [showAddCourse, setShowAddCourse] = useState(false);
+  const [showEditTerm, setShowEditTerm] = useState(false);
   const [activeTool, setActiveTool] = useState(null);
   const [activeTab, setActiveTab] = useState("dashboard");
   const [history, setHistory] = useState([]);
@@ -6321,10 +6715,15 @@ function Dashboard({
 
       <div className="main-content">
         <div className="nav-tabs">
-          {["dashboard", "students", "generate", "history"].map(t => {
+          {(isCollege
+            ? ["dashboard", "semester", "students", "generate", "history"]
+            : ["dashboard", "students", "generate", "history"]
+          ).map(t => {
             const label = t === "students"
               ? (isCollege ? "My Courses" : "Students")
-              : t.charAt(0).toUpperCase() + t.slice(1);
+              : t === "semester"
+                ? "Semester"
+                : t.charAt(0).toUpperCase() + t.slice(1);
             return (
               <button key={t} className={`nav-tab ${activeTab === t ? "active" : ""}`}
                 onClick={() => setActiveTab(t)}>
@@ -6340,6 +6739,34 @@ function Dashboard({
               <h2>Good morning, {firstName}! ☀️</h2>
               <p>Week {weekNum} of your semester. Here's what's on the agenda.</p>
             </div>
+
+            {semesterNeedsSetup && (
+              <div style={{
+                background: "linear-gradient(135deg, var(--green, #4A7C5F), #6a9d80)",
+                borderRadius: 14, padding: "16px 18px", color: "#fff",
+                display: "flex", alignItems: "center", justifyContent: "space-between",
+                gap: 12, flexWrap: "wrap", boxShadow: "0 4px 14px rgba(74,124,95,0.25)",
+                marginBottom: 16,
+              }}>
+                <div style={{ minWidth: 0 }}>
+                  <div style={{ fontSize: "0.74rem", fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.06em", opacity: 0.85, marginBottom: 4 }}>
+                    📅 Semester Setup
+                  </div>
+                  <div style={{ fontSize: "1.02rem", fontWeight: 700 }}>
+                    {!semesterDates?.start
+                      ? "Let's get your semester set up"
+                      : "Your last semester ended — time to plan the next one"}
+                  </div>
+                </div>
+                <button
+                  onClick={() => setActiveTab("semester")}
+                  style={{
+                    background: "#fff", color: "var(--green, #4A7C5F)", border: 0,
+                    borderRadius: 999, padding: "9px 18px", fontWeight: 700,
+                    fontSize: "0.88rem", cursor: "pointer", whiteSpace: "nowrap",
+                  }}>Set Up Semester →</button>
+              </div>
+            )}
 
             {kidsNeedingPlanning.length > 0 && (
               <div style={{ display: "flex", flexDirection: "column", gap: 10, marginBottom: 16 }}>
@@ -6488,6 +6915,21 @@ function Dashboard({
               ))}
             </div>
           </>
+        )}
+
+        {activeTab === "semester" && isCollege && (
+          <SemesterOverviewPage
+            kid={kids[0]}
+            semester={semesterDates}
+            onEditTermDates={() => setShowEditTerm(true)}
+            onAddCourse={() => setShowAddCourse(true)}
+            onDeleteSubject={onDeleteSubject}
+            onLaunchCurriculumUpload={({ kidId, subject }) => setCurriculumUploadFor({ kidId, subject })}
+            onStartNewSemester={async () => {
+              try { await onStartNewSemester(); }
+              catch (e) { console.error(e); alert("Couldn't start a new semester: " + (e.message || "unknown error")); }
+            }}
+          />
         )}
 
         {activeTab === "students" && (
@@ -6785,6 +7227,24 @@ function Dashboard({
         );
       })()}
 
+      {showAddCourse && kids[0] && (
+        <AddCourseModal
+          kidId={kids[0].id}
+          onClose={() => setShowAddCourse(false)}
+          onSave={onSaveCourse}
+        />
+      )}
+
+      {showEditTerm && (
+        <EditTermDatesModal
+          initialStart={semesterDates?.start || ""}
+          initialEnd={semesterDates?.end || ""}
+          initialBreakWeeks={kids[0]?.breakWeeks || []}
+          onClose={() => setShowEditTerm(false)}
+          onSave={onUpdateSemesterDates}
+        />
+      )}
+
       <HelpChat />
     </div>
   );
@@ -6948,7 +7408,7 @@ export default function HomeRoom() {
     loadLessonPlan, saveLessonPlan, assignLessonPlanItem,
     assignGenerationToPlan,
     updateKid, addSubjectToKid, deleteSubject, updateSubjectResources, uploadKidAvatar,
-    completeSetup
+    completeSetup, startNewSemester, updateSemesterDates,
   } = useHomeRoom(user?.id);
 
   // Loading spinner while checking auth session
@@ -6968,10 +7428,16 @@ export default function HomeRoom() {
     </>
   );
 
+  // user_type comes from profiles (loaded in useHomeRoom). If the migration
+  // hasn't been run yet the DB column doesn't exist and userType silently
+  // stays 'parent' — fall back to the value we saved in auth user_metadata
+  // during signup so college users still get the college wizard.
+  const effectiveUserType = user?.userType || userType || "parent";
+
   if (!setupDone) return (
     <>
       <style>{styles}</style>
-      {userType === "student" ? (
+      {effectiveUserType === "student" ? (
         <CollegeSetupFlow
           user={user}
           onSaveSelfKid={saveSelfKid}
@@ -7022,7 +7488,12 @@ export default function HomeRoom() {
         onUploadAvatar={uploadKidAvatar}
         onSignOut={signOut}
         onAddKid={saveKid}
-        mode={userType}
+        mode={effectiveUserType}
+        onSaveSelfKid={saveSelfKid}
+        onSaveCourse={saveCourse}
+        onUpdateCourse={updateCourse}
+        onStartNewSemester={startNewSemester}
+        onUpdateSemesterDates={updateSemesterDates}
       />
     </>
   );
