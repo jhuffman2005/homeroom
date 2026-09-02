@@ -326,3 +326,37 @@ create policy "weekly_checkpoints: own" on weekly_checkpoints
 -- Curriculum resource link on semester plans
 -- ─────────────────────────────────────────────────────────────
 alter table semester_plans add column if not exists curriculum_url text;
+
+-- ─────────────────────────────────────────────────────────────
+-- College mode: a second user_type ("student") where the user IS
+-- the learner. Everything reuses the existing kids/subjects tables:
+--   • student's profile gets user_type = 'student'
+--   • one "self" kids row is auto-created (name = user's name, emoji 🎓)
+--   • each course is a subjects row with extra college-specific columns
+-- Parent mode is unchanged (user_type defaults to 'parent').
+-- ─────────────────────────────────────────────────────────────
+
+alter table profiles add column if not exists user_type text default 'parent';
+-- Keep old rows in the parent lane
+update profiles set user_type = 'parent' where user_type is null;
+
+-- Course-level metadata on subjects (all nullable — parent mode ignores them)
+alter table subjects add column if not exists course_code text;
+alter table subjects add column if not exists professor text;
+alter table subjects add column if not exists meeting_days text[];
+alter table subjects add column if not exists syllabus_url text;
+alter table subjects add column if not exists syllabus_text text;
+
+-- Rebuild handle_new_user so signup can pass user_type through raw_user_meta_data
+create or replace function public.handle_new_user()
+returns trigger language plpgsql security definer as $$
+begin
+  insert into public.profiles (id, name, user_type)
+  values (
+    new.id,
+    coalesce(new.raw_user_meta_data->>'name', split_part(new.email, '@', 1)),
+    coalesce(new.raw_user_meta_data->>'user_type', 'parent')
+  );
+  return new;
+end;
+$$;
